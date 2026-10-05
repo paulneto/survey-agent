@@ -1,0 +1,56 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Personal, machine-local notes / walkthroughs — never committed.
+*.local.md
+DEPLOY_WALKTHROUGH.md
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+*.log
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+# Local survey response dumps + generated runtime/report artifacts (default output dir is ./reports;
+# override with SURVEY_OUTPUT_DIR or output.dir in survey-agent.config.yaml)
+/exports/
+/reports/
+survey_data/
+# Survey-management lifecycle sidecar (local operational state; commit it instead if you want to
+# share validated/tested/live status across a team)
+.registry.json
+# Local reference material (e.g. legacy survey PDFs to rebuild from) — not part of the open core
+ref-surveys/
+*-report.html
+*-pretest-report.html
+dashboard.html
+*-responses.csv
+*-responses.parquet
+
+# local Claude Code settings
+.claude/settings.local.json
+# a filled-in MCP config has machine-specific absolute paths (and maybe a key) — copy from
+# .mcp.json.example (which IS tracked) and keep your real one out of git
+.mcp.json
+build/
+*.egg-info/
+
+# Local-only deployer overlays / private plugins — keep vendor code out of the open core.
+# Brand/vendor themes now live here (e.g. overlay/themes/<name>/) and load via SURVEY_THEMES_DIR
+# or the default ./overlay/themes scan. See docs/dev/DESIGN_DECISIONS.md.
+/overlay/
+
+# Brand/vendor-specific surveys, assets, and templates stay OUT of the open core — keep them in a
+# private overlay/plugin (see /overlay/ above) or outside the repo. The generic templates mechanism
+# (templates/README.md, docs/dev/TEMPLATES.md) ships; brand examples do not.
+
+# Editor workspace files (personal/local)
+*.code-workspace
+
+# Optional local denylist for the vendor-neutrality test (tests/test_api_auth.py) — never committed.
+tests/.denylist

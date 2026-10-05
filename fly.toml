@@ -1,0 +1,48 @@
+# Fly.io deployment for the survey-agent runtime — diskless + scale-to-zero.
+#
+#   fly launch --copy-config --no-deploy     # creates the app from this file
+#   fly volumes create survey_data --size 1  # only if you keep SURVEY_STORE=file
+#   fly deploy
+#
+# The runtime derives its public base URL from FLY_APP_NAME automatically, so drop-in survey_urls
+# are correct with no extra configuration. Override with SURVEY_PUBLIC_BASE_URL for a custom domain.
+#
+# `auto_stop_machines` means you pay only while a respondent is actually taking a survey. A stopped
+# machine wakes on the first request (a second or two) — fine for panel traffic, and the reason Fly
+# suits bursty fielding. For CONTINUOUS fielding across redeploys, prefer a database over `file`.
+app = "my-surveys"
+primary_region = "iad"
+
+[build]
+  builder = "paketobuildpacks/builder:base"
+
+[env]
+  SURVEY_STORE = "file"           # swap to a database for multi-machine / zero-downtime fielding
+  SURVEY_DATA_DIR = "/data"
+  SURVEY_DIR = "surveys"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.http_options.response]
+    pristine = true
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/health"
+  timeout = "5s"
+
+# Only needed while SURVEY_STORE=file. A volume binds to ONE machine, so keep the count at 1 —
+# or move to a database and delete this block entirely.
+[[mounts]]
+  source = "survey_data"
+  destination = "/data"
+
+[processes]
+  app = "survey-agent serve --public --multi --port 8080"

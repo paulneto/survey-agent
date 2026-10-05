@@ -1,0 +1,35 @@
+# Render Blueprint (ZERO-DOWNTIME / CONTINUOUS FIELDING) — diskless + MongoDB.
+#
+# Use this when surveys field continuously and a deploy must NOT interrupt in-progress respondents.
+# With no disk attached, Render brings up the new instance, waits for /health, then switches traffic
+# — a rolling, zero-downtime deploy (and the service can scale to zero). Responses + sessions + quota
+# counters live in Mongo (atomic $inc, multi-instance-safe), not on a per-instance disk.
+#
+# To use it: copy this file over render.yaml (Render's Blueprint reads `render.yaml` at the repo root),
+#   cp render.mongo.yaml render.yaml
+# then in Render → New + → Blueprint → connect your repo → Apply. Provision a free MongoDB Atlas M0
+# cluster first and paste its SRV connection string into SURVEY_MONGODB_URI in the dashboard (it's a
+# secret, so it's sync:false below). Set the Atlas IP access-list to allow Render's egress (or 0.0.0.0/0).
+# Rename `my-surveys` below to taste. See docs/DEPLOY.md and docs/HOSTING.md.
+services:
+  - type: web
+    name: my-surveys
+    runtime: python
+    plan: starter                      # always-on. (diskless ⇒ you may also use `free` for scale-to-zero)
+    buildCommand: pip install ".[llm,mongo]"
+    startCommand: survey-agent serve --public --multi
+    healthCheckPath: /health           # diskless + health-gated switch = rolling zero-downtime deploys
+    envVars:
+      - key: SURVEY_STORE              # MongoDB — multi-instance-safe; no disk, so deploys roll cleanly
+        value: mongo
+      - key: SURVEY_MONGODB_URI        # paste your Atlas SRV string in the dashboard (secret)
+        sync: false
+      - key: SURVEY_MONGODB_DB         # database name inside the cluster
+        value: survey_agent
+      - key: SURVEY_DIR                # which folder holds the survey definitions
+        value: surveys
+      - key: SURVEY_API_TOKEN          # Render generates a secret; read it in the dashboard to pull data
+        generateValue: true
+      # SURVEY_PUBLIC_BASE_URL is auto-derived from Render's RENDER_EXTERNAL_URL; set only to override.
+      - key: PYTHON_VERSION
+        value: "3.12.7"

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "survey-agent": {
+      "type": "stdio",
+      "command": "/ABSOLUTE/PATH/to/survey-agent/.venv/bin/survey-agent-mcp",
+      "env": {
+        "SURVEY_DIR": "/ABSOLUTE/PATH/to/survey-agent/surveys",
+        "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
+      }
+    }
+  }
+}

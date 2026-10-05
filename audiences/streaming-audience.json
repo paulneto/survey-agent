@@ -1,0 +1,10 @@
+{
+  "n": 12,
+  "description": "A declared test population for the streaming screener — who should qualify and who should screen out. `n` is a suggestion; the CLI `--n` overrides it (keep it small with a real LLM — a pre-test makes ~one request per question per persona). Traits map onto the survey's questions (usage -> q_service_use) so synthetic answers are coherent. For TESTING incidence/logic, not a real sample. Point SURVEY_PERSONAS at a real-data source to ground it.",
+  "segments": [
+    { "label": "current heavy", "weight": 0.35, "traits": { "consent": "yes", "usage": "current", "age": 28 } },
+    { "label": "current casual", "weight": 0.25, "traits": { "consent": "yes", "usage": "current", "age": 41 } },
+    { "label": "lapsed (last 6mo)", "weight": 0.20, "traits": { "consent": "yes", "usage": "past6", "age": 52 } },
+    { "label": "never used", "weight": 0.20, "traits": { "consent": "yes", "usage": "never", "age": 63 } }
+  ]
+}

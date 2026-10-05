@@ -1,0 +1,297 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://survey-agent.dev/schemas/survey.schema.json",
+  "title": "Survey Definition",
+  "type": "object",
+  "required": ["survey"],
+  "properties": {
+    "survey": { "$ref": "#/$defs/survey" }
+  },
+  "$defs": {
+    "survey": {
+      "type": "object",
+      "required": ["id", "title", "pages", "actions"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+        "version": { "type": "integer", "minimum": 1 },
+        "title": { "type": "string" },
+        "description": { "type": "string", "description": "What this survey is for — shown in `survey-agent list` / the catalog so an operator managing a series of surveys knows its purpose at a glance." },
+        "tags": { "type": "array", "items": { "type": "string" }, "description": "Free-form labels for grouping/filtering surveys (e.g. \"screener\", \"q3-2026\", \"streaming\")." },
+        "owner": { "type": "string", "description": "Who owns/maintains this survey (display-only)." },
+        "settings": { "$ref": "#/$defs/settings" },
+        "quotas": { "type": "array", "items": { "$ref": "#/$defs/quota" } },
+        "hidden": { "type": "array", "items": { "$ref": "#/$defs/hidden_value" } },
+        "pages": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/page" } },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/action" } }
+      },
+      "additionalProperties": false
+    },
+    "hidden_value": {
+      "type": "object",
+      "description": "A computed/stored derived field. `calc` is a calc-AST node (validated by the engine); or a static `value`, optionally gated by `when`.",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+        "calc": { "type": "object" },
+        "value": {},
+        "when": { "$ref": "#/$defs/logic" },
+        "type": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "settings": {
+      "type": "object",
+      "properties": {
+        "url_variables": { "type": "array", "items": { "type": "string" } },
+        "identity": {
+          "type": "object",
+          "description": "Which URL variables carry identity. Optional; defaults respondent=uid, response=rid. respondent keys dedup/enrichment/erasure; response keys the session/idempotency.",
+          "properties": {
+            "respondent": { "type": "string" },
+            "response": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "enrichments": { "type": "array", "items": { "type": ["string", "object"] } },
+        "theme": { "type": "string" },
+        "css": { "type": "string" },
+        "show_title": {
+          "type": "boolean",
+          "description": "Whether to render the survey title as an <h1> banner atop every page. Omitted = deployment default (env SURVEY_SHOW_TITLE, itself defaulting to true). Set false to drop the repeated title banner when the per-question content already carries the heading."
+        },
+        "default_redirect": { "type": "string" },
+        "retake": {
+          "type": "string",
+          "enum": ["once", "multiple"],
+          "default": "once",
+          "description": "May one respondent (the uid+rid invite link) take this survey more than once? 'once' (default): once a link reaches a terminal it shows an already-completed screen; an in-progress link resumes. 'multiple': returning after finishing starts a fresh response — each completion is kept as its own response record."
+        },
+        "ai": { "type": "object", "description": "LLM analysis/conversation config (e.g. consent notice). Internals are deployer-defined." },
+        "url_signing": {
+          "type": "object",
+          "description": "Inbound URL signing. With `required: true` (and SURVEY_URL_SECRET set on the runtime), a survey link must carry a valid HMAC over `fields` (default: the respondent and response identity vars) or it is refused. Mint links with `survey-agent sign-url`.",
+          "properties": {
+            "required": { "type": "boolean" },
+            "fields": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        },
+        "anti_fraud": {
+          "type": "object",
+          "properties": {
+            "attention_checks": { "type": "array", "items": { "type": "string" } },
+            "min_page_seconds": { "type": "number", "description": "Declared; not enforced by the engine yet (recorded on the spec for a deployer's own speeder check)." },
+            "block_duplicate_uid": { "type": "boolean", "description": "Declared; not enforced by the engine yet (use settings.retake and your panel's own de-duplication)." }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "quota": {
+      "type": "object",
+      "required": ["id", "scope", "limit"],
+      "properties": {
+        "id": { "type": "string" },
+        "scope": { "enum": ["survey", "answer"] },
+        "ref": { "$ref": "#/$defs/ref" },
+        "match": { "type": "array" },
+        "limit": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "page": {
+      "type": "object",
+      "required": ["id", "questions"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+        "title": { "type": "string" },
+        "display_logic": { "$ref": "#/$defs/logic" },
+        "randomization": { "$ref": "#/$defs/randomization" },
+        "repeat": { "$ref": "#/$defs/repeat", "description": "Show this whole page once per item from an earlier answer (page repeating). Answers are stored per item as `qid[item]`." },
+        "questions": { "type": "array", "items": { "$ref": "#/$defs/question" } }
+      },
+      "additionalProperties": false
+    },
+    "question": {
+      "type": "object",
+      "required": ["id", "type"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+        "type": {
+          "enum": ["radio", "checkbox", "dropdown", "dropdown_multi", "text", "textarea", "number",
+                   "grid", "rating", "nps", "ranking", "date", "file", "video", "image", "instructions"]
+        },
+        "cell_type": { "enum": ["radio", "checkbox"] },
+        "title": { "type": "string" },
+        "body": { "type": "string", "description": "Markdown content — headings, **bold**/*italic*, bullet & numbered lists, [links](url), inline ![images](url), blockquotes. The main content of an `instructions` page (a formatted how-to / task instructions); supplemental description on any other question type." },
+        "required": { "type": "boolean" },
+        "probe": { "type": "boolean", "description": "Open-text only: allow ONE adaptive AI follow-up if the answer is thin (opt-in; budget via settings.ai.max_probes). Stored as a derived `probes` field, never changes flow." },
+        "media": {
+          "type": "object",
+          "description": "Stimulus for `video`/`image` (display-only). `url` is required for those types.",
+          "properties": {
+            "url": { "type": "string" },
+            "autoplay": { "type": "boolean", "description": "video only" },
+            "caption": { "type": "string" },
+            "alt": { "type": "string", "description": "image alt text (accessibility)" },
+            "max_width": { "type": "string", "description": "CSS length, e.g. \"480px\" or \"80%\" (default 100%)" },
+            "width": { "type": "string", "description": "CSS length (optional)" },
+            "height": { "type": "string", "description": "CSS length (optional)" }
+          },
+          "additionalProperties": false
+        },
+        "display_logic": { "$ref": "#/$defs/logic" },
+        "randomization": { "$ref": "#/$defs/randomization" },
+        "validation": { "$ref": "#/$defs/validation" },
+        "repeat": { "$ref": "#/$defs/repeat", "description": "Show this question once per item from an earlier answer, all on this page (question repeating). Answers are stored per item as `qid[item]`." },
+        "options": { "type": "array", "items": { "$ref": "#/$defs/option" } },
+        "options_source": {
+          "type": "object",
+          "required": ["pipe_from"],
+          "properties": {
+            "pipe_from": { "type": "string" },
+            "mode": { "enum": ["selected", "not_selected", "all"] },
+            "carry_values": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": { "type": "string" },
+              "label": { "type": "string" },
+              "display_logic": { "$ref": "#/$defs/logic" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "scale_points": { "type": "array" }
+      },
+      "additionalProperties": false
+    },
+    "repeat": {
+      "type": "object",
+      "description": "Repeat over an earlier answer. Inside the repeat, {{loop:label}} / {{loop:value}} / {{loop:index}} / {{loop:total}} pipe the current item, a {\"kind\": \"loop\", \"id\": \"value\"} ref tests it, and `q_x[@]` means this item's answer to an earlier repeated q_x. Exclusive options are never repeated over.",
+      "required": ["source"],
+      "properties": {
+        "source": { "type": "string", "description": "Question id on an earlier page. by=answers: a choice question (radio/checkbox/dropdown/dropdown_multi/ranking); by=value: a number question." },
+        "mode": { "enum": ["selected", "not_selected"], "description": "Repeat for the chosen options (default) or the ones not chosen." },
+        "by": { "enum": ["answers", "value"], "description": "answers (default): one pass per option. value: the source's number N gives N passes (items 1..N)." },
+        "exclude": { "type": "array", "items": { "type": ["string", "number"] }, "description": "Option values never repeated over (e.g. an 'other')." },
+        "max": { "type": "integer", "minimum": 1, "maximum": 150, "description": "Cap on passes (default 50)." },
+        "randomize": { "type": "boolean", "description": "Seeded per-respondent order instead of source order." }
+      },
+      "additionalProperties": false
+    },
+    "option": {
+      "type": "object",
+      "required": ["value"],
+      "properties": {
+        "value": { "type": ["string", "number"] },
+        "label": { "type": "string" },
+        "exclusive": { "type": "boolean" },
+        "display_logic": { "$ref": "#/$defs/logic" }
+      },
+      "additionalProperties": false
+    },
+    "action": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "enum": ["disqualify", "overquota", "skip", "set_variable", "complete", "webhook"] },
+        "when": { "$ref": "#/$defs/logic" },
+        "to_page": { "type": "string" },
+        "dq_message": { "type": "string" },
+        "message": { "type": "string" },
+        "reason_code": { "type": "string" },
+        "name": { "type": "string" },
+        "value": {},
+        "value_from": { "type": "string" },
+        "redirect": { "$ref": "#/$defs/redirect" },
+        "url": { "type": "string" },
+        "method": { "enum": ["POST", "GET", "PUT"] },
+        "payload": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "redirect": {
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["route", "url", "default"] },
+        "task_url": { "type": "string" },
+        "url": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "randomization": {
+      "type": "object",
+      "properties": {
+        "mode": { "enum": ["shuffle", "rotate", "reverse", "none"] },
+        "fixed": { "type": "array", "items": { "type": ["string", "number"] } }
+      },
+      "additionalProperties": false
+    },
+    "validation": {
+      "type": "object",
+      "properties": {
+        "min": { "type": ["number", "string"] },
+        "max": { "type": ["number", "string"] },
+        "percent": { "type": "boolean" },
+        "min_length": { "type": "integer", "minimum": 0 },
+        "max_length": { "type": "integer", "minimum": 0 },
+        "min_words": { "type": "integer", "minimum": 0, "description": "Require at least N whitespace-separated words (a cheap, model-free gate against one-word/gibberish open text)." },
+        "format": { "enum": ["email", "phone"] },
+        "phone_region": { "enum": ["us", "uk", "intl"], "description": "Accepted phone formats when format=phone: us, uk, or intl (default — accepts US, UK, or +country E.164)." },
+        "format_message": { "type": "string" },
+        "regex": { "type": "string", "maxLength": 200, "description": "Pattern the answer must match (re.search). Max 200 chars; nested unbounded quantifiers like (x+)+ are rejected; input is matched up to 2,000 chars." },
+        "regex_message": { "type": "string" },
+        "extensions": { "type": "array", "items": { "type": "string" }, "description": "Allowed file extensions for a `file` question (lowercase, no dot), e.g. [\"zip\",\"json\"]." },
+        "max_files": { "type": "integer", "minimum": 1, "description": "Max number of files a `file` question accepts (default 1)." },
+        "max_size_kb": { "type": "integer", "minimum": 1, "description": "Max size per uploaded file, in KB, for a `file` question." }
+      },
+      "additionalProperties": false
+    },
+    "ref": {
+      "type": "object",
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "enum": ["question", "url_var", "variable", "quota", "enrichment", "loop"] },
+        "id": { "type": "string" },
+        "row": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "logic": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["op", "conditions"],
+          "properties": {
+            "op": { "enum": ["and", "or"] },
+            "conditions": { "type": "array", "items": { "$ref": "#/$defs/logic" } }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["ref", "operator"],
+          "properties": {
+            "ref": { "$ref": "#/$defs/ref" },
+            "operator": {
+              "enum": ["equals", "equals_ordered", "not_equals", "contains", "is_one_of", "is_not_one_of",
+                       "is_answered", "is_not_answered", "greater_than", "less_than",
+                       "greater_or_equal", "less_or_equal", "between", "regex_match",
+                       "is_full", "is_not_full"]
+            },
+            "value": {}
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,9 @@
+id: feedback-nps
+title: Feedback (NPS + reason + CSAT)
+type: feedback-nps
+description: A short feedback check — NPS, the reason for the score, and a satisfaction rating.
+theme: paper
+tags: [feedback, nps, csat]
+params:
+  - { name: slug,  prompt: "Survey id / slug", required: true }
+  - { name: title, prompt: "Survey title",     required: true }

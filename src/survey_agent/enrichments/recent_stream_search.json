@@ -1,0 +1,17 @@
+{
+  "id": "recent_stream_search",
+  "description": "The respondent's most recent streaming-related web search term (last 30 days).",
+  "event_type": "web_search",
+  "window": { "last": "30d" },
+  "criteria": {
+    "op": "or",
+    "conditions": [
+      { "field": "search_term", "operator": "contains_any",
+        "value": ["netflix", "disney", "hbo", "max", "prime video", "streaming", "what to watch"] }
+    ]
+  },
+  "operation": "latest",
+  "field": "search_term",
+  "type": "scalar",
+  "ttl_seconds": 3600
+}

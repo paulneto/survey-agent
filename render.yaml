@@ -1,0 +1,34 @@
+# Render Blueprint (SIMPLE / LOW-TRAFFIC) — flat files on a persistent disk. One file provisions
+# the whole multi-survey "my-surveys" service. Deploy: Render → New + → Blueprint → connect your
+# (private) deploy repo → Apply. One service serves EVERY survey in surveys/ at /s/<id>; responses
+# are flat files on the disk; pull them via GET /api/responses (token-gated). Rename `my-surveys` below.
+#
+# ⚠️ NOT zero-downtime. A Render disk mounts to one instance at a time, so Render stop-starts the
+#    single instance on every deploy → a ~30s–2min outage across all surveys. Fine if you field in
+#    bursts; if you field CONTINUOUSLY, copy `render.mongo.yaml` over this file instead — it's diskless
+#    + Mongo and gets rolling, zero-downtime deploys (and scale-to-zero). See docs/DEPLOY.md.
+services:
+  - type: web
+    name: my-surveys
+    runtime: python
+    plan: starter                      # always-on; a persistent disk requires a paid instance
+    buildCommand: pip install ".[llm]"
+    startCommand: survey-agent serve --public --multi
+    healthCheckPath: /health
+    disk:
+      name: survey-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: SURVEY_STORE              # flat files (for zero-downtime, use render.mongo.yaml instead)
+        value: file
+      - key: SURVEY_DATA_DIR           # responses → /var/data/responses/<id>.jsonl on the disk
+        value: /var/data
+      - key: SURVEY_DIR                # which folder holds the survey definitions
+        value: surveys
+      - key: SURVEY_API_TOKEN          # Render generates a secret; read it in the dashboard to pull data
+        generateValue: true
+      # SURVEY_PUBLIC_BASE_URL is NOT needed — the runtime reads Render's own RENDER_EXTERNAL_URL
+      # and builds drop-in survey_urls from it automatically. Set it only to override (custom domain).
+      - key: PYTHON_VERSION
+        value: "3.12.7"

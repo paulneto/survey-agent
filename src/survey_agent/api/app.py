@@ -1,0 +1,228 @@
+"""The FastAPI app for the survey-agent API gateway. See `survey_agent.api` for the why.
+
+Auth is layered, and each layer is opt-in:
+
+- **Single bearer token** (`SURVEY_API_TOKEN`) — the original zero-config gate; still works unchanged.
+- **`sa_` API keys** — per-user/per-agent keys, sha256-hash-only storage (`auth.apikeys`), minted by a
+  signed-in human at `/keys` or server-to-server at `/provision/cli-token`.
+- **Google OAuth session** — humans sign in (`auth.oauth`); we issue a signed-JWT cookie (`auth.sessions`).
+
+If NONE of {token, OAuth, persistent API-key store} is configured, the gateway runs WITHOUT auth
+(local/dev; the CLI warns) — exactly as before. The heavy auth deps (Authlib, PyJWT, itsdangerous)
+are imported lazily, so this module imports fine in plain token-only mode even without the `[auth]`
+extra; the OAuth wiring only activates when a deployer configures it.
+
+The respondent *runtime* keeps its own direct store on the hot path; this gateway is the control
+plane (authoring, lifecycle, reporting reads).
+"""
+import hmac
+import os
+
+try:
+    from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+except Exception as e:  # pragma: no cover
+    raise SystemExit("the API gateway needs the [api] extra: pip install 'survey-agent[api]'") from e
+
+from survey_agent import definitions as _definitions
+from survey_agent import store as _store
+from survey_agent.api.auth import config as _authcfg
+from survey_agent.api.auth import deps as _authdeps
+from survey_agent.api.auth import provision as _provision
+
+app = FastAPI(title="survey-agent API", version="1",
+              summary="Authenticated front door to the survey-agent data backend (definitions + responses).")
+
+
+def _persistent_keystore() -> bool:
+    """True when the deployment uses a persistent (Mongo) key store — i.e. API keys are 'configured'
+    as an auth mechanism, not just the in-memory dev default."""
+    return (os.environ.get("SURVEY_STORE", "memory").lower() == "mongo"
+            or os.environ.get("SURVEY_DEFINITION_SOURCE", "file").lower() == "mongo")
+
+
+def _auth_active(store=None) -> bool:
+    """Any auth mechanism configured? If not, the gateway stays open (local/dev), exactly as before.
+
+    Active when ANY of: the single bearer token is set, Google OAuth is configured, a persistent
+    (Mongo) key store is in use, or at least one API key has been minted in the current store."""
+    if bool(os.environ.get("SURVEY_API_TOKEN")) or _authcfg.oauth_configured() or _persistent_keystore():
+        return True
+    if store is not None:
+        try:
+            return bool(store.list())
+        except Exception:
+            return False
+    return False
+
+
+# Fail loud: a deployer who wires up Google OAuth but leaves the session key as the dev placeholder
+# (or unset) would have forgeable sessions. Refuse to start rather than silently accept that.
+if _authcfg.oauth_configured() and _authcfg.SESSION_JWT_KEY in ("", _authcfg.DEV_SESSION_KEY):
+    raise SystemExit(
+        "SURVEY_GOOGLE_CLIENT_ID/SECRET are set but SURVEY_SESSION_JWT_KEY is unset or still the dev "
+        "placeholder — OAuth sessions would be forgeable. Set SURVEY_SESSION_JWT_KEY to a strong secret."
+    )
+
+# The OAuth + /keys routers are always mounted: the login/callback routes self-gate (503 when OAuth
+# is unconfigured) and Authlib is imported lazily inside them, so mounting costs nothing in token-only
+# mode. Only the SessionMiddleware — which Authlib needs to stash the OAuth state/nonce (a signed
+# cookie via itsdangerous) across the redirect — is gated on OAuth being configured, so no
+# itsdangerous/Authlib import happens when OAuth is off.
+from survey_agent.api.auth import keys_ui as _keys_ui  # noqa: E402  (self-gating routes, lazy heavy deps)
+from survey_agent.api.auth import oauth as _oauth  # noqa: E402
+
+app.include_router(_oauth.router)
+app.include_router(_keys_ui.router)
+
+if _authcfg.oauth_configured():
+    from starlette.middleware.sessions import SessionMiddleware
+
+    app.add_middleware(SessionMiddleware, secret_key=_authcfg.SESSION_JWT_KEY,
+                       https_only=True, same_site="lax")
+
+
+_DEFS = None
+_RESP = None
+
+
+def _defs():
+    """The backing definition store — built once; the gateway is the only process that opens it."""
+    global _DEFS
+    if _DEFS is None:
+        if os.environ.get("SURVEY_DEFINITION_SOURCE", "file").lower() == "http":
+            raise RuntimeError("the API gateway must back onto a real store (mongo/file), not http — "
+                               "run it with SURVEY_DEFINITION_SOURCE=mongo (or file)")
+        _DEFS = _definitions.get_definition_store()
+    return _DEFS
+
+
+def _resp():
+    global _RESP
+    if _RESP is None:
+        if os.environ.get("SURVEY_STORE", "memory").lower() == "http":
+            raise RuntimeError("the API gateway must back onto a real store, not http — "
+                               "run it with SURVEY_STORE=mongo (or file)")
+        _RESP = _store.get_store()
+    return _RESP
+
+
+def _token_ok(request: Request) -> bool:
+    """True if the request carries the configured single bearer SURVEY_API_TOKEN."""
+    token = os.environ.get("SURVEY_API_TOKEN")
+    if not token:
+        return False
+    got = request.headers.get("authorization", "")
+    if got.startswith("Bearer "):
+        got = got[7:]
+    return hmac.compare_digest(got, token)
+
+
+def require_auth(request: Request, store=Depends(_authdeps.get_key_store)):
+    """Layered gate for every /v1 route: accept the single bearer SURVEY_API_TOKEN OR an `sa_` API key
+    OR a valid OAuth session cookie. If no auth mechanism is configured at all, stay open (dev)."""
+    if not _auth_active(store):
+        return
+    if _token_ok(request):
+        return
+    if _authdeps.principal_or_none(request, store):
+        return
+    raise HTTPException(status_code=401, detail="missing or invalid credentials (bearer token, API key, or sign-in)")
+
+
+@app.get("/health")
+def health(store=Depends(_authdeps.get_key_store)):
+    return {"ok": True, "auth": _auth_active(store)}
+
+
+@app.get("/whoami")
+def whoami(request: Request, store=Depends(_authdeps.get_key_store)):
+    """The current principal — token bearer, API key, signed-in user, or anonymous."""
+    if _token_ok(request):
+        return {"principal": {"kind": "token"}}
+    principal = _authdeps.principal_or_none(request, store)
+    return {"principal": principal or {"kind": "anonymous"}}
+
+
+v1 = APIRouter(prefix="/v1", dependencies=[Depends(require_auth)])
+
+
+# ---- definitions seam (specs + lifecycle) ----
+@v1.get("/surveys")
+def list_surveys():
+    return _defs().list_surveys()
+
+
+@v1.get("/definitions/{survey_id}/versions")
+def iter_versions(survey_id: str):
+    return _defs().iter_versions(survey_id)
+
+
+@v1.get("/definitions/{survey_id}")
+def get_definition(survey_id: str, version: int = Query(None)):
+    spec = _defs().get_definition(survey_id, version=version)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="unknown survey")
+    return spec
+
+
+@v1.put("/definitions")
+async def put_definition(request: Request):
+    spec = await request.json()
+    return {"version": _defs().put_definition(spec)}
+
+
+@v1.delete("/definitions/{survey_id}")
+def delete_definition(survey_id: str):
+    _defs().delete_definition(survey_id)
+    return {"ok": True}
+
+
+@v1.get("/registry/{survey_id}")
+def get_registry(survey_id: str):
+    reg = _defs().get_registry(survey_id)
+    if reg is None:
+        raise HTTPException(status_code=404, detail="unknown survey")
+    return reg
+
+
+@v1.post("/registry/{survey_id}")
+async def set_registry(survey_id: str, request: Request):
+    fields = dict(await request.json() or {})
+    approve = fields.pop("approve", None) or request.headers.get("x-survey-launch-approval")
+    if fields.get("status") == "live":       # marking live goes through the same gate as every surface
+        from survey_agent.config import may_mark_live
+        ok, reason = may_mark_live(approve, surface="api")
+        if not ok:
+            raise HTTPException(status_code=403, detail=reason)
+    _defs().set_registry(survey_id, **fields)
+    return _defs().get_registry(survey_id) or {}
+
+
+# ---- response store (read side; the runtime writes to its own direct store) ----
+@v1.get("/responses-counts")
+def response_counts():
+    by = getattr(_resp(), "count_responses_by_survey", None)
+    return by() if by else {}
+
+
+@v1.get("/responses/{survey_id}/count")
+def response_count(survey_id: str):
+    cr = getattr(_resp(), "count_responses", None)
+    if cr:
+        return cr(survey_id)
+    rows = _resp().list_responses(survey_id)
+    comp = sum(1 for r in rows if r.get("status") == "Complete")
+    dq = sum(1 for r in rows if r.get("status") == "Disqualified")
+    return {"complete": comp, "disqualified": dq, "total": len(rows)}
+
+
+@v1.get("/responses/{survey_id}")
+def list_responses(survey_id: str, uid: str = Query(None)):
+    return _resp().list_responses(survey_id, uid=uid)
+
+
+app.include_router(v1)
+
+# Server-to-server provisioning: a trusted SSO broker mints per-user sa_ keys here (off unless
+# SURVEY_PROVISION_API_KEY is set → 404 when off). Mint-only; not under the /v1 auth gate.
+app.include_router(_provision.router)

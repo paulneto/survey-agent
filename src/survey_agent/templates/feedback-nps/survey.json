@@ -1,0 +1,54 @@
+{
+  "survey": {
+    "id": "${slug}",
+    "version": 1,
+    "title": "${title}",
+    "description": "A short feedback check: NPS, the reason for the score, and a satisfaction rating.",
+    "settings": {
+      "url_variables": ["uid", "rid"],
+      "identity": { "respondent": "uid", "response": "rid" },
+      "theme": "paper",
+      "default_redirect": "default"
+    },
+    "pages": [
+      {
+        "id": "p_nps",
+        "questions": [
+          {
+            "id": "q_nps",
+            "type": "nps",
+            "required": true,
+            "title": "How likely are you to recommend us to a friend or colleague?",
+            "scale_points": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+          }
+        ]
+      },
+      {
+        "id": "p_why",
+        "questions": [
+          {
+            "id": "q_reason",
+            "type": "textarea",
+            "required": false,
+            "title": "What's the main reason for your score?"
+          }
+        ]
+      },
+      {
+        "id": "p_csat",
+        "questions": [
+          {
+            "id": "q_csat",
+            "type": "rating",
+            "required": false,
+            "title": "Overall, how satisfied are you?",
+            "scale_points": [1, 2, 3, 4, 5]
+          }
+        ]
+      }
+    ],
+    "actions": [
+      { "type": "complete", "redirect": { "kind": "default" } }
+    ]
+  }
+}

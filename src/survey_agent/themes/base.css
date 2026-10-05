@@ -1,0 +1,40 @@
+/* Shared structural CSS for all survey themes. Colours/spacing come from per-theme tokens
+   injected as :root{--ms-*}. Keep this purely structural; put brand values in tokens.json. */
+*{box-sizing:border-box}
+body{
+  font:16px/1.6 var(--ms-font, -apple-system,Segoe UI,Roboto,sans-serif);
+  background:var(--ms-bg,#fff);
+  color:var(--ms-text,#1a1a2e);
+  max-width:var(--ms-max-width,640px);
+  margin:0 auto;padding:48px 24px;min-height:100vh;
+}
+.brandbar{height:4px;border-radius:4px;margin-bottom:28px;
+  background:linear-gradient(90deg,var(--ms-primary,#1b3f8a),var(--ms-accent,#4ea8de))}
+h1{font-size:22px;font-weight:700;letter-spacing:-.01em;margin:0 0 6px}
+.lead{color:var(--ms-muted,#666);margin-top:0}
+.q{margin:18px 0;padding:18px 20px;background:var(--ms-surface,#fff);
+  border:1px solid var(--ms-border,#e3e3ef);border-radius:var(--ms-radius,12px);
+  box-shadow:var(--ms-shadow,none)}
+.q .title{font-weight:600;margin-bottom:12px}
+/* display-only image stimulus: full-width, frameless (no question-card chrome) so slide images
+   read as full-bleed banners rather than questions. The image carries its own background. */
+.q.media{background:transparent;border:none;box-shadow:none;padding:0;margin:14px 0;overflow:hidden}
+.q.media img{display:block;margin:0 auto;width:100%;height:auto}
+label{display:block;margin:8px 0;cursor:pointer}
+input[type=radio],input[type=checkbox]{accent-color:var(--ms-primary,#1b3f8a);margin-right:9px}
+input[type=text],input[type=number],textarea,select{
+  width:100%;padding:10px 12px;font:inherit;border-radius:8px;
+  border:1px solid var(--ms-border,#e3e3ef);
+  background:var(--ms-bg,#fff);color:var(--ms-text,#1a1a2e)}
+button{background:var(--ms-primary,#1b3f8a);color:var(--ms-primary-text,#fff);border:0;
+  padding:12px 22px;border-radius:9px;font-size:15px;font-weight:600;cursor:pointer;margin-top:10px}
+button:hover{filter:brightness(1.08)}
+a{color:var(--ms-accent,#4ea8de)}
+a.btn{text-decoration:none}
+.err{color:var(--ms-danger,#cc0000);font-size:14px;margin-top:8px}
+.meta{color:var(--ms-muted,#8a8aa3);font-size:13px}
+.term{padding:28px;border-radius:var(--ms-radius,12px);
+  background:var(--ms-surface,#f5f5fb);border:1px solid var(--ms-border,#e3e3ef)}
+code{background:rgba(127,127,127,.16);padding:2px 6px;border-radius:5px;font-size:13px}
+.switcher{margin-top:18px;font-size:13px}
+.switcher a{margin-right:10px}

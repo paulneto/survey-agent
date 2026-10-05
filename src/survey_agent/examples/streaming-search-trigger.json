@@ -1,0 +1,34 @@
+{
+  "id": "streaming-search-trigger",
+  "description": "When someone searches for a streaming service, offer the streaming screener so we can ask them why — while it's fresh.",
+  "enabled": true,
+
+  "detect": {
+    "event_type": "web_search",
+    "window": { "last": "1d" },
+    "criteria": {
+      "op": "or",
+      "conditions": [
+        { "field": "search_term", "operator": "contains_any",
+          "value": ["netflix", "disney", "hbo", "max", "prime video", "streaming", "what to watch"] }
+      ]
+    },
+    "operation": "exists"
+  },
+
+  "survey": "streaming-usage",
+
+  "launch": {
+    "target_completes": 2000,
+    "budget": { "currency": "USD", "max_total": 1200 },
+    "metadata": { "estimated_minutes": 3 }
+  },
+
+  "throttle": {
+    "cooldown_days": 30,
+    "max_offers_per_run": 500,
+    "max_offers_per_day": 3000
+  },
+
+  "poll_interval_seconds": 60
+}

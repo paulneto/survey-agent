@@ -1,0 +1,12 @@
+id: data-download
+title: Data download (screen → request → confirm)
+type: data-download
+description: Screen for use of a service, walk through requesting a data export, confirm, then route onward.
+theme: paper
+tags: [data-download, data-export, screener]
+params:
+  - { name: slug,    prompt: "Survey id / slug",                 required: true }
+  - { name: title,   prompt: "Survey title",                     required: true }
+  - { name: service, prompt: "Service name (e.g. ChatGPT, Amazon)", default: "the service" }
+requires:
+  url_variables: [uid, rid]

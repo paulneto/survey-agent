@@ -1,0 +1,222 @@
+{
+  "survey": {
+    "id": "piping-showcase",
+    "version": 1,
+    "title": "Piping Showcase",
+    "description": "Worked example of every piping form: merge codes (label vs value, multi-select lists, grid cells, URL values, calculated values), fallbacks for answers that may be missing, and option piping (selected / not selected), including the cases that used to go wrong.",
+    "tags": [
+      "example",
+      "piping"
+    ],
+    "settings": {
+      "url_variables": [
+        "uid",
+        "rid",
+        "src"
+      ],
+      "theme": "paper",
+      "default_redirect": "default"
+    },
+    "hidden": [
+      {
+        "id": "n_services",
+        "calc": {
+          "op": "count_selected",
+          "ref": {
+            "kind": "question",
+            "id": "q_services"
+          }
+        }
+      }
+    ],
+    "pages": [
+      {
+        "id": "p_intro",
+        "questions": [
+          {
+            "id": "q_hello",
+            "type": "instructions",
+            "title": "Thanks for joining from {{url:src|the web}}",
+            "body": "This short study shows how answers are carried forward. Add `&src=email` to the link to see the URL value change."
+          },
+          {
+            "id": "q_name",
+            "type": "text",
+            "title": "What should we call you? (optional)"
+          }
+        ]
+      },
+      {
+        "id": "p_services",
+        "title": "Hi {{q:q_name.answer|there}}",
+        "questions": [
+          {
+            "id": "q_services",
+            "type": "checkbox",
+            "required": true,
+            "title": "Which streaming services do you pay for?",
+            "options": [
+              {
+                "value": "netflix",
+                "label": "Netflix"
+              },
+              {
+                "value": "prime",
+                "label": "Prime Video"
+              },
+              {
+                "value": "disney",
+                "label": "Disney+"
+              },
+              {
+                "value": "max",
+                "label": "Max"
+              },
+              {
+                "value": "hulu",
+                "label": "Hulu"
+              },
+              {
+                "value": "none",
+                "label": "None of these",
+                "exclusive": true
+              }
+            ]
+          },
+          {
+            "id": "q_tried",
+            "type": "checkbox",
+            "title": "Which have you tried in the past but don't pay for now? (optional)",
+            "options": [
+              {
+                "value": "netflix",
+                "label": "Netflix"
+              },
+              {
+                "value": "prime",
+                "label": "Prime Video"
+              },
+              {
+                "value": "disney",
+                "label": "Disney+"
+              },
+              {
+                "value": "max",
+                "label": "Max"
+              },
+              {
+                "value": "hulu",
+                "label": "Hulu"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "p_fav",
+        "title": "{{var:n_services}} service(s) — {{q:q_services.answer}}",
+        "questions": [
+          {
+            "id": "q_fav",
+            "type": "radio",
+            "required": true,
+            "title": "Of the ones you pay for, which is your favourite?",
+            "body": "_Option piping (selected): only what you picked, and never \"None of these\"._",
+            "options_source": {
+              "pipe_from": "q_services",
+              "mode": "selected"
+            }
+          },
+          {
+            "id": "q_next",
+            "type": "radio",
+            "title": "Which one you don't have would you most consider adding?",
+            "body": "_Option piping (not selected). Skipped automatically if you picked them all._",
+            "options_source": {
+              "pipe_from": "q_services",
+              "mode": "not_selected"
+            }
+          },
+          {
+            "id": "q_tried_best",
+            "type": "radio",
+            "title": "Of the ones you tried before, which did you like best?",
+            "body": "_Piped from an optional question: skipped, not shown empty, if you left that blank._",
+            "options_source": {
+              "pipe_from": "q_tried",
+              "mode": "selected"
+            }
+          }
+        ]
+      },
+      {
+        "id": "p_rate",
+        "title": "About {{q:q_fav.answer}}",
+        "questions": [
+          {
+            "id": "q_grid",
+            "type": "grid",
+            "required": true,
+            "title": "How would you rate {{q:q_fav.answer}} on…",
+            "rows": [
+              {
+                "id": "r_price",
+                "label": "Price"
+              },
+              {
+                "id": "r_content",
+                "label": "Content"
+              }
+            ],
+            "options": [
+              {
+                "value": "good",
+                "label": "Good"
+              },
+              {
+                "value": "ok",
+                "label": "OK"
+              },
+              {
+                "value": "poor",
+                "label": "Poor"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "p_why",
+        "questions": [
+          {
+            "id": "q_why",
+            "type": "textarea",
+            "title": "You rated {{q:q_fav.answer}}'s content as **{{q:q_grid.row:r_content.answer}}** and its price as **{{q:q_grid.row:r_price.answer}}**. Tell us more.",
+            "body": "_Behind the scenes: your favourite is stored as `{{q:q_fav.value}}`; you'd consider {{q:q_next.answer|nothing else}}; you liked {{q:q_tried_best.answer|— (none tried)}} best before._"
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "type": "disqualify",
+        "reason_code": "no_services",
+        "dq_message": "Thanks! This study is for people who pay for at least one streaming service.",
+        "when": {
+          "ref": {
+            "kind": "question",
+            "id": "q_services"
+          },
+          "operator": "contains",
+          "value": "none"
+        }
+      },
+      {
+        "type": "complete",
+        "redirect": {
+          "kind": "default"
+        }
+      }
+    ]
+  }
+}

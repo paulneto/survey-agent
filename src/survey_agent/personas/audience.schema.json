@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://survey-agent.dev/schemas/audience.schema.json",
+  "title": "Persona audience",
+  "description": "A declared test population for survey-agent `pretest`. The recommended form is an object with weighted `segments`; a bare list of personas or a single persona also validate. TESTING only — not a real sample.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["segments"],
+      "properties": {
+        "n": { "type": "integer", "minimum": 1, "description": "total respondents to allocate across segments by weight" },
+        "description": { "type": "string" },
+        "segments": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/persona" } }
+      },
+      "additionalProperties": false
+    },
+    { "type": "array", "items": { "$ref": "#/$defs/persona" } },
+    { "$ref": "#/$defs/persona" }
+  ],
+  "$defs": {
+    "persona": {
+      "type": "object",
+      "description": "One persona (or a segment of them, with `weight`).",
+      "properties": {
+        "label": { "type": "string", "description": "short human label (display + LLM role-play)" },
+        "weight": { "type": "number", "exclusiveMinimum": 0, "description": "relative proportion within an audience" },
+        "segment": { "type": "string", "description": "grouping label for the report" },
+        "traits": {
+          "type": "object",
+          "description": "freeform key→value profile (string/number); drives LLM role-play + fuzzy coherence. Use values resembling your option text, e.g. {\"usage\": \"never\", \"age\": 34}.",
+          "additionalProperties": { "type": ["string", "number", "boolean"] }
+        },
+        "answers": {
+          "type": "object",
+          "description": "EXACT answers keyed by question id, validated by the engine (wins over traits). Best practice for a real-data source. Value matches the question's option value / number / text.",
+          "additionalProperties": { "type": ["string", "number", "array"] }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

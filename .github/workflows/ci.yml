@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install (editable, with dev + mcp + auth extras)
+        run: pip install -e ".[dev,mcp,auth]"
+      - name: Run tests
+        run: pytest -q
+      - name: Validate + round-trip the example surveys
+        run: |
+          for f in surveys/*.survey.json; do survey-agent validate "$f"; done
+          for f in surveys/*.md; do
+            survey-agent compile "$f" > /tmp/c.json
+            python -c "import json,sys; b='$f'[:-3]+'.survey.json'; assert json.load(open('/tmp/c.json'))==json.load(open(b)), b+' MD/JSON drift'"
+          done
+      - name: Coverage gate (simulate)
+        run: survey-agent simulate surveys/streaming-usage.survey.json -n 300
+
+  wheel:
+    # Build the distributable wheel and prove it works OUTSIDE the checkout (catches missing
+    # package-data and anything that only works from a source tree).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+      - name: Install the wheel into a clean venv and selftest
+        run: |
+          python -m venv /tmp/wheelenv
+          /tmp/wheelenv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/wheelenv/bin/survey-agent --version
+          /tmp/wheelenv/bin/survey-agent selftest

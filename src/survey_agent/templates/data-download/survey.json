@@ -1,0 +1,72 @@
+{
+  "survey": {
+    "id": "${slug}",
+    "version": 1,
+    "title": "${title}",
+    "description": "Screen for use of ${service}, walk through requesting a data export, confirm the request, then route to the upload step.",
+    "settings": {
+      "url_variables": ["uid", "rid"],
+      "identity": { "respondent": "uid", "response": "rid" },
+      "theme": "paper",
+      "default_redirect": "default"
+    },
+    "pages": [
+      {
+        "id": "p_screen",
+        "questions": [
+          {
+            "id": "q_used",
+            "type": "radio",
+            "required": true,
+            "title": "Did you use ${service} last month?",
+            "body": "Please answer honestly.",
+            "options": [
+              { "value": "yes", "label": "Yes" },
+              { "value": "no", "label": "No" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "p_request",
+        "questions": [
+          {
+            "id": "i_howto",
+            "type": "instructions",
+            "title": "Request your data export",
+            "body": "Here's how to request your data export from ${service}:\n\n1. TODO: step one\n2. TODO: step two\n3. TODO: confirm the export\n\nYou should receive your file shortly."
+          },
+          {
+            "id": "q_confirm",
+            "type": "checkbox",
+            "required": true,
+            "title": "Please confirm you have requested your file.",
+            "options": [
+              { "value": "requested", "label": "I have requested my file from ${service}" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "p_done",
+        "questions": [
+          {
+            "id": "i_done",
+            "type": "instructions",
+            "title": "That's it",
+            "body": "Thanks — you'll receive the upload step shortly."
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "type": "disqualify",
+        "reason_code": "did_not_use_service",
+        "dq_message": "Thanks for your honesty — this task is only for people who used ${service} last month.",
+        "when": { "ref": { "kind": "question", "id": "q_used" }, "operator": "equals", "value": "no" }
+      },
+      { "type": "complete", "redirect": { "kind": "default" } }
+    ]
+  }
+}

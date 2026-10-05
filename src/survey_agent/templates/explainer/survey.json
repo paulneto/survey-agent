@@ -1,0 +1,83 @@
+{
+  "survey": {
+    "id": "${slug}",
+    "version": 1,
+    "title": "${title}",
+    "description": "A multi-page explainer with a required agreement, an optional contact, and a thank-you.",
+    "settings": {
+      "url_variables": ["uid", "rid"],
+      "identity": { "respondent": "uid", "response": "rid" },
+      "theme": "paper",
+      "default_redirect": "default"
+    },
+    "pages": [
+      {
+        "id": "p_welcome",
+        "questions": [
+          {
+            "id": "i_welcome",
+            "type": "instructions",
+            "title": "${title}",
+            "body": "Welcome. TODO: a line or two on what this is and why they're here.\n\nTap **Next** to continue."
+          }
+        ]
+      },
+      {
+        "id": "p_how",
+        "questions": [
+          {
+            "id": "i_how",
+            "type": "instructions",
+            "title": "How it works",
+            "body": "TODO: explain the process in a few steps.\n\n1. First step\n2. Second step\n3. Third step"
+          }
+        ]
+      },
+      {
+        "id": "p_rules",
+        "questions": [
+          {
+            "id": "i_rules",
+            "type": "instructions",
+            "title": "The rules",
+            "body": "TODO: list the terms participants are agreeing to.\n\n- First rule\n- Second rule\n- Third rule"
+          },
+          {
+            "id": "q_agree",
+            "type": "checkbox",
+            "required": true,
+            "options": [
+              { "value": "agree", "label": "I agree to the rules above." }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "p_contact",
+        "questions": [
+          {
+            "id": "q_contact",
+            "type": "text",
+            "required": false,
+            "title": "Want updates? Leave a contact detail. (optional)",
+            "body": "*Used only to contact you about this study.*"
+          }
+        ]
+      },
+      {
+        "id": "p_thanks",
+        "questions": [
+          {
+            "id": "i_thanks",
+            "type": "instructions",
+            "title": "Thank you",
+            "body": "Thanks for completing this — you're all set."
+          }
+        ]
+      }
+    ],
+    "actions": [
+      { "type": "complete", "redirect": { "kind": "default" } }
+    ]
+  }
+}

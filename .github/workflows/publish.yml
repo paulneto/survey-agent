@@ -1,0 +1,59 @@
+name: Publish to PyPI
+
+# Builds the wheel + sdist and publishes to PyPI when a GitHub Release is published.
+# Uses PyPI Trusted Publishing (OIDC) — no API token/secret to manage. One-time setup:
+#   PyPI → your project → Publishing → add a trusted publisher for this repo + workflow.
+# Guards: the full test suite must pass, and the release tag (vX.Y.Z) must equal project.version.
+on:
+  release:
+    types: [published]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Release tag must match project.version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag=$TAG  project.version=$VERSION"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::release tag '$TAG' does not match project.version 'v$VERSION' — bump pyproject.toml or retag"
+            exit 1
+          fi
+      - name: Install (editable, with dev + mcp + auth extras)
+        run: pip install -e ".[dev,mcp,auth]"
+      - name: Run tests
+        run: pytest -q
+
+  build-and-publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write          # required for trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        run: |
+          pip install build
+          python -m build
+      - name: Check metadata
+        run: |
+          pip install twine
+          twine check dist/*
+      - name: Smoke-test the built wheel in a clean venv
+        run: |
+          python -m venv /tmp/wheelenv
+          /tmp/wheelenv/bin/pip install dist/*.whl
+          cd /tmp && /tmp/wheelenv/bin/survey-agent --version && /tmp/wheelenv/bin/survey-agent selftest
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

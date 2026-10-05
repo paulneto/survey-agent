@@ -1,0 +1,7 @@
+# sdist contents beyond what setuptools collects from the package + package-data.
+include README.md LICENSE NOTICE CHANGELOG.md
+# The test suite depends on repo fixtures (surveys/, docs/, skills/, ...) that are not shipped, so it
+# is excluded rather than shipped half-runnable. Run the tests from a git checkout.
+prune tests
+prune build
+prune src/survey_agent.egg-info

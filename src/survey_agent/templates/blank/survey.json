@@ -1,0 +1,25 @@
+{
+  "survey": {
+    "id": "${slug}",
+    "version": 1,
+    "title": "${title}",
+    "description": "TODO: one line on what this survey is for.",
+    "settings": {
+      "url_variables": ["uid", "rid"],
+      "identity": { "respondent": "uid", "response": "rid" },
+      "theme": "paper",
+      "default_redirect": "default"
+    },
+    "pages": [
+      {
+        "id": "p1",
+        "questions": [
+          { "id": "q1", "type": "text", "required": true, "title": "TODO: your first question." }
+        ]
+      }
+    ],
+    "actions": [
+      { "type": "complete", "redirect": { "kind": "default" } }
+    ]
+  }
+}

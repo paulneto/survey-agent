@@ -1,0 +1,56 @@
+{
+  "survey": {
+    "id": "${slug}",
+    "version": 1,
+    "title": "${title}",
+    "description": "Screen respondents on a qualifying question and route qualifiers to the next step.",
+    "settings": {
+      "url_variables": ["uid", "rid"],
+      "identity": { "respondent": "uid", "response": "rid" },
+      "theme": "paper",
+      "default_redirect": "default"
+    },
+    "pages": [
+      {
+        "id": "p_screen",
+        "questions": [
+          {
+            "id": "q_qualify",
+            "type": "radio",
+            "required": true,
+            "title": "TODO: your qualifying question?",
+            "options": [
+              { "value": "yes", "label": "Yes" },
+              { "value": "no", "label": "No" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "p_followup",
+        "questions": [
+          {
+            "id": "q_followup",
+            "type": "checkbox",
+            "required": true,
+            "title": "TODO: a question only qualifiers see.",
+            "options": [
+              { "value": "a", "label": "Option A" },
+              { "value": "b", "label": "Option B" },
+              { "value": "c", "label": "Option C" }
+            ]
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "type": "disqualify",
+        "reason_code": "not_qualified",
+        "dq_message": "Thanks for your time — you don't qualify for this one.",
+        "when": { "ref": { "kind": "question", "id": "q_qualify" }, "operator": "equals", "value": "no" }
+      },
+      { "type": "complete", "redirect": { "kind": "default" } }
+    ]
+  }
+}

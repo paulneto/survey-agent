@@ -1,0 +1,34 @@
+{
+  "_comment": "Per-respondent behavioral fixtures for the demo so per-user gating is real. In production these rows live in a warehouse and are pulled by the respondent id. Keys are uids; `_default` is used for anyone else.",
+  "1001": {
+    "_persona": "Maya — recently searched for streaming; heavy entertainment-app user",
+    "web_search": [
+      { "search_term": "netflix price increase", "days_ago": 2 },
+      { "search_term": "disney plus vs max", "days_ago": 6 }
+    ],
+    "app_usage": [
+      { "app_name": "Netflix", "app_category": "Entertainment", "minutes": 320, "days_ago": 1 },
+      { "app_name": "Max", "app_category": "Entertainment", "minutes": 180, "days_ago": 3 }
+    ]
+  },
+  "1002": {
+    "_persona": "Tom — no streaming search; mostly social apps",
+    "web_search": [
+      { "search_term": "best trail running shoes", "days_ago": 1 },
+      { "search_term": "pizza near me", "days_ago": 2 }
+    ],
+    "app_usage": [
+      { "app_name": "Instagram", "app_category": "Social", "minutes": 210, "days_ago": 1 }
+    ]
+  },
+  "1003": {
+    "_persona": "Priya — searched 'what to watch' once; light entertainment-app use",
+    "web_search": [
+      { "search_term": "what to watch this weekend", "days_ago": 4 }
+    ],
+    "app_usage": [
+      { "app_name": "Prime Video", "app_category": "Entertainment", "minutes": 45, "days_ago": 2 }
+    ]
+  },
+  "_default": { "web_search": [], "app_usage": [] }
+}

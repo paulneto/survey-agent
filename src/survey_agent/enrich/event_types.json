@@ -1,0 +1,27 @@
+{
+  "_comment": "Example event-type catalog: maps an event_type to a warehouse table + its columns. Replace with your own schema, or point SURVEY_EVENT_TYPES at your own catalog file. time_field is used for windowing; duration_field (if any) for time-spent aggregates; id_field (optional) names the respondent-id column (default respondent_id, or SURVEY_ENRICH_ID_FIELD). When `fields` is listed, compiled SQL only accepts those columns (plus the time/duration/id fields).",
+  "web_search": {
+    "table": "search_events",
+    "time_field": "event_time",
+    "fields": ["search_term", "url"],
+    "duration_field": null
+  },
+  "app_usage": {
+    "table": "app_usage_events",
+    "time_field": "event_time",
+    "fields": ["app_name", "app_category", "minutes"],
+    "duration_field": "minutes"
+  },
+  "page_view": {
+    "table": "page_view_events",
+    "time_field": "event_time",
+    "fields": ["url", "domain", "page_title", "minutes"],
+    "duration_field": "minutes"
+  },
+  "purchase": {
+    "table": "purchase_events",
+    "time_field": "event_time",
+    "fields": ["item_name", "brand", "category", "price"],
+    "duration_field": null
+  }
+}

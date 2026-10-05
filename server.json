@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.paulneto/survey-agent",
+  "description": "Agentic survey engine — author, stress-test, run, and analyze logic-gated surveys & screeners, and run one inline (begin_survey/answer_survey) to collect clean structured data from a human. The structured-elicitation primitive for agents.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/paulneto/survey-agent",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/paulneto/survey-agent",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "survey-agent",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": { "type": "stdio" },
+      "packageArguments": [
+        { "type": "named", "name": "--from", "value": "survey-agent[mcp,llm]" },
+        { "type": "positional", "value": "survey-agent-mcp" }
+      ],
+      "environmentVariables": [
+        { "name": "SURVEY_DIR", "description": "Directory holding your *.survey.json files", "isRequired": false, "default": "surveys" },
+        { "name": "ANTHROPIC_API_KEY", "description": "Claude key for the agentic features (optional — an offline stub is used without one)", "isRequired": false, "isSecret": true },
+        { "name": "OPENAI_API_KEY", "description": "OpenAI/Codex key (alternative to Claude)", "isRequired": false, "isSecret": true },
+        { "name": "SURVEY_LAUNCH_APPROVAL_TOKEN", "description": "If set, launch_survey is gated behind this human-supplied token", "isRequired": false, "isSecret": true }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "_comment": "Canned behavioral events for the StaticProvider (local demo/tests). `days_ago` is converted to a recent timestamp at resolve time so the file stays stable. In production these rows live in a warehouse.",
+  "web_search": [
+    { "search_term": "netflix price increase", "days_ago": 2 },
+    { "search_term": "disney plus vs max", "days_ago": 5 },
+    { "search_term": "what to watch this weekend", "days_ago": 9 },
+    { "search_term": "best trail running shoes", "days_ago": 1 }
+  ],
+  "app_usage": [
+    { "app_name": "Netflix", "app_category": "Entertainment", "minutes": 62, "days_ago": 1 },
+    { "app_name": "Max", "app_category": "Entertainment", "minutes": 35, "days_ago": 3 },
+    { "app_name": "Prime Video", "app_category": "Entertainment", "minutes": 48, "days_ago": 6 },
+    { "app_name": "Instagram", "app_category": "Social", "minutes": 210, "days_ago": 1 }
+  ]
+}
