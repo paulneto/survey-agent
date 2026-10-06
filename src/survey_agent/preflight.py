@@ -91,12 +91,16 @@ def _ping_store(store):
 
 
 def runtime_preflight(env=None, store=None, integration=None, store_kind=None,
-                      sign_required=False, url_secret=None, ping=True):
+                      sign_required=False, url_secret=None, ping=True, signed_surveys=None):
     """Return a list of (level, message) for the runtime at startup.
 
     level ∈ {"fatal", "warn", "info"}. The caller stops the server on any "fatal" (unless the
     operator sets SURVEY_ALLOW_INSECURE=1) and prints the rest. Pure except for an optional store
-    liveness ping (pass ping=False to skip, e.g. in tests)."""
+    liveness ping (pass ping=False to skip, e.g. in tests).
+
+    `sign_required` (single-survey mode) or `signed_surveys` (multi mode: the ids of served surveys
+    whose definition sets settings.url_signing.required) turn on the URL-signing checks. The runtime
+    fails closed per request regardless — this only surfaces the misconfiguration at startup."""
     env = env if env is not None else os.environ
     integration = (integration if integration is not None
                    else _sel(env, "SURVEY_INTEGRATION")).lower()
@@ -120,12 +124,15 @@ def runtime_preflight(env=None, store=None, integration=None, store_kind=None,
                 f"value before production."))
 
     # --- url signing required but secret missing/placeholder ---
-    if sign_required:
+    signed_surveys = [s for s in (signed_surveys or []) if s]
+    if sign_required or signed_surveys:
         us = url_secret if url_secret is not None else _sel(env, "SURVEY_URL_SECRET")
+        us = (us or "").strip()
+        which = (f" (survey(s): {', '.join(sorted(signed_surveys))})" if signed_surveys else "")
         if not us:
             issues.append(("warn",
-                "settings.url_signing.required is set but SURVEY_URL_SECRET is not — URL signatures "
-                "are NOT being checked. Set the secret to enforce."))
+                f"settings.url_signing.required is set{which} but SURVEY_URL_SECRET is not — every "
+                "invitation to those surveys is REFUSED (403, fail closed) until you set the secret."))
         elif us == DEV_PLACEHOLDER:
             issues.append(("fatal",
                 "SURVEY_URL_SECRET is the dev placeholder but url signing is required — signatures "

@@ -24,7 +24,7 @@ then it installs from GitHub (`pip install "git+https://github.com/paulneto/surv
 ## Drive it as an agent
 
 - MCP connector: `claude mcp add survey-agent -- uvx --from "survey-agent[mcp,llm]" survey-agent-mcp`. It exposes the loop as typed tools (`save_survey`, `validate_survey`, `simulate_survey`, `critique_survey`, `pretest_survey`, `launch_survey`, `list_surveys`, `survey_report`, …) plus `begin_survey`/`answer_survey` for collecting structured answers from a human mid-task
-- Launch gate: when `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, no surface can mark a survey live without that human-supplied token; when it is unset, the local CLI and console can, and the MCP connector and API gateway cannot
+- Launch gate: when `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, no surface can mark a survey live without that human-supplied token; when it is unset, the local CLI and console can, and the MCP connector and API gateway cannot. Saving or editing a definition never changes what respondents are served: only an approved mark-live moves the registry's `live_version`
 - Host capabilities: [docs/AGENT_HOSTS.md](https://github.com/paulneto/survey-agent/blob/main/docs/AGENT_HOSTS.md): which hosts can drive it (Claude Code / Claude desktop / claude.ai / ChatGPT / Codex) and what each can and cannot do
 - Skills: [skills/](https://github.com/paulneto/survey-agent/tree/main/skills): the authoring workflow for Claude Code (author-survey, edit-survey, add-logic, test-survey, launch-survey, survey-report, inline-survey)
 - CLI: `survey-agent help` (one command per step); most read/check commands take `--json`

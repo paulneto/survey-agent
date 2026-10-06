@@ -14,8 +14,9 @@ author-supplied text into something executable:
   alternation inside a repeated group (`(a|aa)+`) — patterns over `MAX_PATTERN_LENGTH` chars, and
   the matched input is capped at `MAX_REGEX_INPUT` characters.
 
-No I/O — safe to import from the engine. (`regex` is a core dependency; if it's somehow missing we
-fall back to `re` with the static checks only.)
+No I/O — safe to import from the engine. (`regex` is a core dependency. If it is somehow missing,
+survey patterns are refused rather than run without a time limit: logic treats them as no match and
+question validation skips the check.)
 """
 import functools
 import re
@@ -146,8 +147,8 @@ def safe_search(pattern, text):
     if regex_problem(pattern):
         return None
     subject = str(text)[:MAX_REGEX_INPUT]
-    if _regex is None:  # pragma: no cover - static checks only
-        return re.search(pattern, subject) is not None
+    if _regex is None:  # fail closed: never run an author pattern without an execution bound
+        return None
     try:
         return _compiled(pattern).search(subject, timeout=REGEX_TIMEOUT_SECONDS) is not None
     except TimeoutError:

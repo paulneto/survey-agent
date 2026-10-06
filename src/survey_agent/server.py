@@ -223,8 +223,9 @@ else:
     RT = SurveyRuntime(SPEC)
     VER = RT.d.get("version", 1)
     LIMITS = _limits_for(RT)
-    # Inbound URL-param signing (opt-in): enforced only when the survey sets settings.url_signing.required
-    # AND a shared secret is configured (SURVEY_URL_SECRET). The engine ships the primitive
+    # Inbound URL-param signing (opt-in): a survey that sets settings.url_signing.required needs a
+    # valid `sig` over its fields, keyed by SURVEY_URL_SECRET — and with no secret configured every
+    # invitation is refused (fail closed; see _signature_check). The engine ships the primitive
     # (engine/signing.py); the deployment decides whether eligibility params must be HMAC-signed.
     _SIGN_CFG = RT.d.get("settings", {}).get("url_signing") or {}
     SIGN_REQUIRED = bool(_SIGN_CFG.get("required"))
@@ -376,18 +377,40 @@ var el=document.getElementById('__fp');if(el)el.value=JSON.stringify(fp);
 }catch(e){}})();</script>"""
 
 
-def _signature_ok(query, rt=None):
-    """Is this inbound link's signature acceptable? True unless the survey requires signing AND a
-    secret is configured AND the `sig` param fails to verify — so signing is opt-in and a forged
-    uid/rid/group can't create a session. Verification itself is the pure engine primitive."""
+def _url_secret():
+    """The configured URL-signing secret, or None when it is unset / empty / whitespace."""
+    return URL_SECRET if (URL_SECRET or "").strip() else None
+
+
+def _signing_required(rt):
+    return bool((rt.d.get("settings", {}).get("url_signing") or {}).get("required"))
+
+
+_SIGNING_UNCONFIGURED = "signed links are required but not configured"
+
+
+def _signature_check(query, rt=None):
+    """None when this inbound link is acceptable, else a short reason. Signing is opt-in per survey
+    (`settings.url_signing.required`) and **fails closed**: a survey that requires signed links while
+    no SURVEY_URL_SECRET is configured refuses every invitation — in single and multi mode alike, and
+    for surveys published after startup (checked on every request, not just at preflight). With a
+    secret, the `sig` param must verify over the configured fields, so a forged uid/rid/group can't
+    create a session. Verification itself is the pure engine primitive."""
     rt = rt or RT
-    cfg = (rt.d.get("settings", {}).get("url_signing") or {})
-    required = bool(cfg.get("required"))
+    if not _signing_required(rt):
+        return None
+    secret = _url_secret()
+    if secret is None:
+        return _SIGNING_UNCONFIGURED
+    cfg = rt.d.get("settings", {}).get("url_signing") or {}
     fields = cfg.get("fields") or [rt.respondent_var, rt.response_var]
-    if not (required and URL_SECRET):
-        return True
     from survey_agent.engine import signing
-    return signing.verify(query, URL_SECRET, fields)
+    return None if signing.verify(query, secret, fields) else "invalid signature"
+
+
+def _signature_ok(query, rt=None):
+    """Is this inbound link's signature acceptable? (see _signature_check — fails closed)."""
+    return _signature_check(query, rt) is None
 
 
 def _new_session_token():
@@ -425,24 +448,48 @@ def _session_lock(session_id):
 
 
 _QUOTA_FALLBACK_LOCK = threading.Lock()
+_QUOTA_FALLBACK_KEYS = {}        # (survey_id, version, key) -> bool, for stores without reserve_quotas
 
 
-def reserve_quotas(survey_id, version, limits):
+def _accepts_key(fn):
+    """Does a store's reserve_quotas take the `key=` idempotency kwarg? (a bring-your-own store
+    written against the older interface may not)."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "key" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
+def reserve_quotas(survey_id, version, limits, key=None):
     """Atomically take one slot in every bucket of `limits` ({quota_id: limit|None}) iff each limited
     one is below its limit — all-or-nothing. Delegates to the store's atomic `reserve_quotas`; a store
-    without it gets a process-local check-and-increment (correct for one runtime process only)."""
+    without it gets a process-local check-and-increment (correct for one runtime process only).
+
+    `key` (the response id) makes it idempotent: a repeated call with the same key returns the first
+    outcome without incrementing again — so a terminal retried after a failure, or processed by two
+    workers from the same session snapshot, holds at most one slot. A custom store whose
+    reserve_quotas predates `key` is called without it (not idempotent across retries)."""
     if not limits:
         return True
     fn = getattr(STORE, "reserve_quotas", None)
     if callable(fn):
+        if key is not None and _accepts_key(fn):
+            return bool(fn(survey_id, version, limits, key=key))
         return bool(fn(survey_id, version, limits))
     with _QUOTA_FALLBACK_LOCK:
+        rkey = None if key is None else (survey_id, version, str(key))
+        if rkey is not None and rkey in _QUOTA_FALLBACK_KEYS:
+            return _QUOTA_FALLBACK_KEYS[rkey]
         counts = STORE.quota_counts(survey_id, version)
-        if any(lim is not None and counts.get(qid, 0) >= lim for qid, lim in limits.items()):
-            return False
-        for qid in limits:
-            STORE.incr_quota(survey_id, version, qid)
-        return True
+        ok = not any(lim is not None and counts.get(qid, 0) >= lim for qid, lim in limits.items())
+        if ok:
+            for qid in limits:
+                STORE.incr_quota(survey_id, version, qid)
+        if rkey is not None:
+            _QUOTA_FALLBACK_KEYS[rkey] = ok
+        return ok
 
 
 def quota_state(rt=None):
@@ -466,43 +513,81 @@ def _mint_response_id():
     return uuid.uuid4().hex
 
 
+def terminal_unrecorded(session):
+    """True when this session reached a terminal whose processing didn't finish (a storage failure or
+    crash between the steps of on_terminal): it carries the `terminal_pending` intent but not
+    `terminal_recorded`. The next GET/POST for the session re-runs on_terminal, which is idempotent.
+    (Sessions from releases before `terminal_pending` existed are never re-processed.)"""
+    return bool(session) and bool(session.get("terminal_pending")) and not session.get("terminal_recorded")
+
+
 def on_terminal(session, terminal, rt=None):
     """Accept a terminal: reserve quota (complete only), record the response once, fire the passback.
     Returns the terminal actually applied — a `complete` that loses the race for the last quota slot
-    comes back as the survey's over-quota terminal. Idempotent per session: a session whose terminal
-    was already recorded is never re-reserved, re-recorded or re-fired."""
+    comes back as the survey's over-quota terminal.
+
+    Every step is idempotent and keyed by the response id, and ordered so a failure anywhere leaves
+    the session retryable (terminal_unrecorded) rather than lost or double-counted:
+
+      0. persist the intent (`terminal_pending`, the terminal status) — so a retry knows what to redo
+      1. reserve_quotas(..., key=response_id)  — a repeat returns the first outcome, no 2nd increment
+      2. STORE.record_response(...)            — an upsert by response id: never two records
+      3. only then set + persist `terminal_recorded`
+      4. INTEGRATION.terminal(...)             — best-effort, carries the response-id idempotency key
+
+    Two workers holding the same session snapshot (separate processes/hosts, no shared lock) therefore
+    hold one quota slot and write one response; the passback may fire twice with the same
+    idempotency key (receivers dedupe on it). A session already recorded is never re-reserved,
+    re-recorded or re-fired."""
     rt = rt or RT
     if session.get("terminal_recorded"):
-        return terminal
+        return session.get("terminal_applied") or terminal
     if session.get("preview"):                  # operator preview: walk the flow, but record/passback nothing
         session["date_submitted"] = now_iso()
         session["terminal_recorded"] = True
         STORE.save_session(session)
         return terminal
+    if session.get("terminal_pending"):         # a retry: redo the SAME terminal the session reached
+        terminal = session["terminal_pending"]
+    else:
+        session["terminal_pending"] = terminal
+    session.setdefault("date_submitted", now_iso())       # stable across retries
+    STORE.save_session(session)                            # (0) the intent survives a crash
+    from survey_agent.engine.runtime import response_id as _response_id
     ver = rt.d.get("version", 1)
     limits = _limits_for(rt)
+    applied = terminal
     if terminal["status"] == "completed":
         # Atomic all-or-nothing reservation BEFORE the completion is accepted: two respondents racing
-        # for the last slot can't both complete (the engine's is_full check ran on a snapshot).
+        # for the last slot can't both complete (the engine's is_full check ran on a snapshot). Keyed
+        # by the response id, so a retry / a second worker gets the same answer without a 2nd slot.
         want = {qid: limits.get(qid) for qid in rt.quota_buckets(session)}
-        if want and not reserve_quotas(rt.d["id"], ver, want):
-            terminal = rt.overquota_terminal(session)
+        if want and not reserve_quotas(rt.d["id"], ver, want, key=_response_id(session)):   # (1)
+            applied = rt.overquota_terminal(session)
+        else:
+            session["status"] = terminal["status"]         # (a retry after an earlier overquota view)
     # opt-in, audited LLM analysis on the respondent's answers (fail-open). Lands in the response
-    # (derived + llm_audit) and can be piped to screen.
-    try:
-        vals, audit = enrich.resolve_llm_for_session(rt.d, session, now=now_iso())
-        session.setdefault("enrichments", {}).update(vals)
-        if audit:
-            session["llm_audit"] = audit
-    except Exception:
-        pass
-    session["date_submitted"] = now_iso()
-    session["terminal_recorded"] = True
-    STORE.save_session(session)
-    STORE.record_response(rt.d["id"], export.response_from_session(
+    # (derived + llm_audit) and can be piped to screen. Run once per terminal, not again on a retry.
+    if not session.get("terminal_enriched"):
+        try:
+            vals, audit = enrich.resolve_llm_for_session(rt.d, session, now=now_iso())
+            session.setdefault("enrichments", {}).update(vals)
+            if audit:
+                session["llm_audit"] = audit
+        except Exception:
+            pass
+        session["terminal_enriched"] = True
+    session["terminal_applied"] = applied
+    STORE.record_response(rt.d["id"], export.response_from_session(                    # (2)
         rt, session, session.get("date_started"), session.get("date_submitted")))
-    INTEGRATION.terminal(session, terminal["status"], reason_code=terminal.get("reason_code"))
-    return terminal
+    session["terminal_recorded"] = True
+    STORE.save_session(session)                                                          # (3)
+    try:                                                                                 # (4)
+        INTEGRATION.terminal(session, applied["status"], reason_code=applied.get("reason_code"))
+    except Exception:
+        log.exception("terminal passback failed", extra={"survey_id": rt.d.get("id"),
+                                                         "session_id": session.get("session_id")})
+    return applied
 
 
 # ----------------------------------------------------------------- HTML
@@ -1077,7 +1162,14 @@ class Handler(BaseHTTPRequestHandler):
                 # explicit pre-live state (draft/validated/tested/approved) — respondents can't reach it;
                 # operators preview it. state None = unmanaged (single-file serve) → served as before.
                 return self._send(200, _not_open_page(theme=theme))
-            if not preview and not _signature_ok(query, rt):  # opt-in HMAC (forged link → no session); preview token suffices
+            sig_problem = None if preview else _signature_check(query, rt)  # preview token suffices
+            if sig_problem == _SIGNING_UNCONFIGURED:  # fail closed: required signing, no secret
+                log.warning("invitation refused: url signing required but SURVEY_URL_SECRET is not set",
+                            extra={"survey_id": survey_id})
+                return self._send(403, _html(
+                    "<div class='term'><h1>Link not valid</h1><p>Signed links are required but not "
+                    "configured for this survey. Please contact the study team.</p></div>", theme=theme))
+            if sig_problem:                         # opt-in HMAC (forged link → no session)
                 return self._send(403, _html(
                     "<div class='term'><h1>Link not valid</h1><p>This survey link is missing or has an "
                     "invalid signature. Please open the original link you were sent.</p></div>", theme=theme))
@@ -1096,10 +1188,11 @@ class Handler(BaseHTTPRequestHandler):
                                         response_id=_mint_response_id()),
                          date_started=now_iso(), token=_new_session_token(),
                          **({"preview": True} if preview else {})))
+        pinned_ok = True
         if not created:                             # resume on the version the session started on
             rt = rt_for_session(survey_id, session, live_rt)
             if rt is None:
-                rt = live_rt
+                rt, pinned_ok = live_rt, False
                 if session.get("status") not in TERMINAL_STATUSES:
                     # The pinned definition is gone: never continue its answers on different content.
                     # The invite link is the capability, so restart this take cleanly on the live
@@ -1108,10 +1201,12 @@ class Handler(BaseHTTPRequestHandler):
                                 extra={"survey_id": survey_id, "session_id": session.get("session_id"),
                                        "version": session.get("version")})
                     was_preview = session.get("preview")
+                    discarded = store_pkg.record_upload_refs(session)   # blobs of the dropped answers
                     session = dict(rt.new_session(session["session_id"], query, response_id=_mint_response_id()),
                                    date_started=now_iso(), token=_new_session_token(),
                                    **({"preview": True} if (was_preview or preview) else {}))
                     STORE.save_session(session)
+                    _delete_uploads(discarded)      # only after the restart is persisted
                     created = True
         dirty = ensure_session_fields(session, rt)
         if theme:  # the theme chosen on the landing page sticks to the whole session
@@ -1119,6 +1214,11 @@ class Handler(BaseHTTPRequestHandler):
             dirty = True
         if dirty:
             STORE.save_session(session)
+        if session["status"] in TERMINAL_STATUSES and pinned_ok and terminal_unrecorded(session):
+            # an earlier terminal didn't finish recording (storage failure / crash): finish it now —
+            # idempotently (same quota reservation, one response record) — and show its ending.
+            term = on_terminal(session, session["terminal_pending"], rt)
+            return self._send(200, render_terminal(session, term, rt))
         if session["status"] in TERMINAL_STATUSES:
             if rt.retake != "multiple" and not session.get("preview"):  # default "once": a finished link is locked
                 return self._send(200, _html(_html_inner_terminal_again(), theme=session_theme(session, rt)))
@@ -1148,6 +1248,8 @@ class Handler(BaseHTTPRequestHandler):
             session["enrichments"] = enrich.resolve_for_survey(rt.d, uid, ENRICH)
             STORE.save_session(session)
         step = rt.start(session, quota_state(rt)) if session["page_pointer"] < 0 else rt.current_page(session, quota_state(rt))
+        if "terminal" in step and not session.get("terminal_recorded"):
+            session["terminal_pending"] = step["terminal"]  # persisted with the terminal status (retryable)
         STORE.save_session(session)
         if "terminal" in step:
             term = on_terminal(session, step["terminal"], rt)
@@ -1212,6 +1314,14 @@ class Handler(BaseHTTPRequestHandler):
             if session.get("status") in TERMINAL_STATUSES:
                 return self._send(200, _html(_html_inner_terminal_again(), theme=session_theme(session, live_rt)))
             return self._send(409, _html(_SURVEY_UPDATED_HTML, theme=session_theme(session, live_rt)))
+        if session.get("status") in TERMINAL_STATUSES and terminal_unrecorded(session):
+            # The terminal was reached but its recording didn't finish (storage failure / crash):
+            # finish it idempotently instead of refusing — answers are NOT re-submitted.
+            term = on_terminal(session, session["terminal_pending"], rt)
+            dest = terminal_destination(session, term)
+            if dest:
+                return self._redirect(dest)
+            return self._send(200, render_terminal(session, term, rt))
         if session.get("status") in TERMINAL_STATUSES:
             # Already finished (completed / screened-out / over-quota). Refuse to reprocess — this is
             # what stops a respondent hitting Back to the screen-out page and changing the answer to
@@ -1479,13 +1589,37 @@ def _responses_csv(rows):
     return buf.getvalue()
 
 
+def _signed_surveys():
+    """Multi mode: ids of the served surveys whose live definition requires signed links (for the
+    startup preflight). Best-effort — per-request enforcement (_signature_check) is the real gate and
+    also covers surveys published after startup."""
+    out = []
+    try:
+        entries = defstore().list_surveys() or []
+    except Exception:
+        log.exception("preflight: could not list surveys")
+        return out
+    for e in entries:
+        sid = (e or {}).get("id")
+        if not sid or e.get("missing_file"):
+            continue
+        try:
+            rt = load_rt(sid)
+        except Exception:
+            rt = None
+        if rt is not None and _signing_required(rt):
+            out.append(sid)
+    return out
+
+
 def _run_preflight():
     """Print startup warnings and refuse to start on a fatal misconfiguration (unless the operator
     sets SURVEY_ALLOW_INSECURE=1). Surfaces dev-placeholder secrets, an unreachable store, and the
     ephemeral-disk data-loss trap before any respondent traffic arrives."""
     from survey_agent import preflight
     issues = preflight.runtime_preflight(store=STORE, sign_required=(not MULTI and SIGN_REQUIRED),
-                                         url_secret=URL_SECRET)
+                                         url_secret=URL_SECRET,
+                                         signed_surveys=_signed_surveys() if MULTI else None)
     for lvl, msg in issues:
         if lvl != "fatal":
             print(f"[runtime] {'⚠️ ' if lvl == 'warn' else '✓'} {msg}")

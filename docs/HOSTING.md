@@ -7,8 +7,8 @@
 > unless you configure auth** (see [The API gateway](#the-api-gateway--one-authenticated-front-door-to-the-data)).
 > **Erasure** is built in: `survey-agent dsar <id> --delete` erases a subject's responses, sessions,
 > uploaded files and queued webhook deliveries; copies outside the app (passbacks already sent,
-> exports, backups, logs, downstream systems) are yours to clear. Terminal passbacks are **best-effort, fire-once** with an
-> idempotency key; the optional durable outbox (`SURVEY_OUTBOX=1`) covers mid-survey webhook
+> exports, backups, logs, downstream systems) are yours to clear. Terminal passbacks are **best-effort**
+> and carry an idempotency key (a retried completion can repeat one, always with the same key); the optional durable outbox (`SURVEY_OUTBOX=1`) covers mid-survey webhook
 > **actions** only. For a local or single-box deployment none of this bites; for a shared team
 > deployment, plan for it.
 
@@ -241,7 +241,8 @@ Things the runtime does so it behaves on a real host:
 - **Response headers and logs.** Survey pages and data responses are sent with
   `Cache-Control: no-store`, and every runtime response with `Referrer-Policy: no-referrer` and
   `X-Content-Type-Options: nosniff`. Log lines carry a short hash in place of session and response
-  ids, and URLs reduced to scheme, host and path (no query string).
+  ids, and URLs (`url` and any `*_url` field) reduced to `scheme://host[:port]#<8-hex fingerprint>`:
+  never the path, query or userinfo, since a webhook URL often carries its secret in the path.
 - **What goes into the image.** `.dockerignore` excludes everything by default and re-includes only
   what the image needs: `src/`, the packaging files, `surveys/*.survey.json`, `surveys/*.md`,
   `surveys/.registry.json`, `surveys/.versions/` and `triggers/*.json`. Local data (`survey_data/`,
@@ -293,7 +294,13 @@ SURVEY_DEFINITION_SOURCE=http SURVEY_STORE=http \
 launch approval (`X-Survey-Launch-Approval` header or an `approve` field) matching
 `SURVEY_LAUNCH_APPROVAL_TOKEN`. With no approval token configured, the gateway can't mark a survey
 live at all. A CLI pointed at the gateway (`SURVEY_DEFINITION_SOURCE=http`) forwards the approval it
-verified from `--approve`.
+verified from `--approve`. A `live_version` that doesn't exist is a 400, and an approved mark-live
+that names no `live_version` pins the newest saved version.
+
+**Saving definitions.** `PUT /v1/definitions` takes `{"survey": {...}}`, validates it (a 422 lists the
+errors) and stores a new version. It never changes what respondents are served: the registry reports
+that version as `latest_version`, and `live_version` moves only with an approved registry write.
+Survey ids must match `^[A-Za-z0-9_-]+$` (an invalid id is a 400 on registry writes and deletes).
 
 The console still binds `127.0.0.1` by default and is itself unauthenticated; if you host it for a
 team (`--host 0.0.0.0`), put it behind your own auth proxy or VPN. The gateway does not provide

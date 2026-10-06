@@ -20,6 +20,9 @@ scope** — they belong to whatever panel adapter a deployer plugs into the `int
 - **Surveys/themes/enrichments/triggers are flat files.** Add a file + a small hook; don't build CMS UI.
 - **Definitions are immutable + versioned.** Edits create a new version; in-flight sessions stay pinned.
   The `file` source keeps snapshots in `surveys/.versions/<id>/v<N>.survey.json` — commit them.
+- **Saving is not approving.** No backend's `put_definition` moves the registry's `live_version`; only
+  an approval-gated mark-live does (and with no explicit version it pins the newest saved one).
+  `get_registry` reports `live_version` and `latest_version` separately. Keep it that way.
 - **Server-driven page flow:** a question that depends on another answer goes on a *later page*
   (`validate` rejects a same-page or later-page dependency). The same holds for a `repeat` source.
 - **Repeated answers are ordinary answers.** A `repeat` stores each item's answer as `qid[item]`
@@ -36,6 +39,12 @@ scope** — they belong to whatever panel adapter a deployer plugs into the `int
   extra `repeat: {source, value, label}` — additive, so existing consumers are unaffected.
 - The `webhook` **action** is fire-once per session and network-free in the engine: `submit()` returns
   resolved intents under `result["webhooks"]`; the caller delivers them via `integrations.webhook.deliver`.
+- Terminal processing (`server.on_terminal`) is retry-safe: persist the intent → `reserve_quotas(...,
+  key=response_id)` → `record_response` (an upsert by response id) → mark recorded → best-effort
+  integration call (a failure is logged, never shown to the respondent). Stores must keep both
+  `reserve_quotas` idempotent per key and `record_response` an upsert.
+- Signed links fail closed: a survey with `settings.url_signing.required` refuses every invitation
+  while `SURVEY_URL_SECRET` is unset or blank.
 
 ## Code layout (packaged under `src/survey_agent/`)
 Importable modules live in `src/survey_agent/` (namespace package; installed via `pip install -e .`).

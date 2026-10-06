@@ -173,7 +173,8 @@ On a `quota` ref, any operator other than `is_full`/`is_not_full` compares again
 `is_full` reads a snapshot, so two respondents can both pass it while racing for the last slot. The
 runtime settles that at completion: a `complete` atomically reserves a slot in every quota bucket the
 session falls into, all or nothing, and if any bucket is full the completion becomes the survey's
-`overquota` ending (its message or redirect) instead. A session's ending is processed once. Any
+`overquota` ending (its message or redirect) instead. A session's ending is processed once: the
+reservation is keyed by the response id, so a retried completion gets the same outcome. Any
 `webhook` action earlier in the survey may already have fired by then.
 
 ### `action.type` — what logic can *do* (6)

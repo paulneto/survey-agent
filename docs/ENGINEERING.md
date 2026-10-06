@@ -103,6 +103,14 @@ store (file / sqlite / mongo / http / your own) ── sessions · quota counter
   `mongo` stores every version. If a pinned version can't be loaded, the runtime never continues the
   session on different content: a submit asks the respondent to reopen their link, and the invite
   link restarts the take on the live version.
+- **Saving a definition never changes what is served.** The registry keeps the approved
+  `live_version` (what respondents get) apart from `latest_version` (the newest saved version), and
+  `get_registry` reports both. Saving on any backend, including the gateway's `PUT /v1/definitions`,
+  only adds a version. Only an approved mark-live (`launch`, `publish`, `status --set live`, the
+  console's Mark live, a gated gateway registry write) moves `live_version`; one that names no version
+  pins the newest saved one. With `file` definitions, an edited file that ships without an approved
+  launch/publish keeps serving the approved snapshot, so deploy `surveys/.registry.json` and
+  `surveys/.versions/` together (a pin whose snapshot is missing makes that survey 404).
 
 ### 1.3 Modules & extension points
 
@@ -117,7 +125,7 @@ The core is `engine/` (pure, offline). Everything else plugs in via selectors:
 | Storage | `store/` (`memory`/`file`/`sqlite`/`mongo`/`http`/`your.pkg:Store`); default `file`; `mongo` is a reference backend | `SURVEY_STORE` |
 | Definitions + lifecycle | `definitions/` (`file`/`mongo`/`http`/import path): serve specs + status from files or a runtime store; a runtime store makes publish and pause/close store writes (no redeploy), version-pinned | `SURVEY_DEFINITION_SOURCE` |
 | API gateway (front door) | `api/` (FastAPI, `[api]` extra): exposes the definitions + read-side store seams over HTTP. Clients (console/agent/CLI) set `…=http` and become stdlib HTTP clients (no extra dependency) instead of opening their own DB connection. The respondent runtime keeps a direct store (hot path). | `SURVEY_API_BASE`, `SURVEY_API_TOKEN` |
-| Serving gate (lifecycle) | the runtime serves respondents only when state ∈ serve-states (default `live`); `paused`/`closed` show their pages, other pre-live states show "not open yet"; operators preview pre-live surveys with a token (preview sessions collect nothing). Marking live pins `live_version`. A survey with no registry state (single-file `serve`) is unmanaged and served as before | `SURVEY_SERVE_STATES`, `SURVEY_PREVIEW_TOKEN` |
+| Serving gate (lifecycle) | the runtime serves respondents only when state ∈ serve-states (default `live`); `paused`/`closed` show their pages, other pre-live states show "not open yet"; operators preview pre-live surveys with a token (preview sessions collect nothing). An approved mark-live pins `live_version`; saving a definition never moves it. A survey with no registry state (single-file `serve`) is unmanaged and served as before | `SURVEY_SERVE_STATES`, `SURVEY_PREVIEW_TOKEN` |
 | Launch gate | one rule for every surface: with a token set, marking live needs it; unset, the local CLI/console may mark live and the MCP connector may not | `SURVEY_LAUNCH_APPROVAL_TOKEN` |
 | Uploads (blob store) | `store/uploads.py` (`local`/`s3`): bytes of `file` answers; the response keeps only a reference. Contract: `put`, `open`, `url`, `delete` (used by erasure and to drop rejected uploads); every upload gets a unique key, so nothing is overwritten | `SURVEY_UPLOAD_STORE` |
 | Context sources | `enrich/`: `static` (fixtures) and the reference warehouse adapter; `source: url_var`; `source: llm` (completion-time analysis) | `SURVEY_ENRICH`, per-spec `source` |
@@ -194,7 +202,8 @@ Configuration is env-driven; keep secrets in your platform's secret manager. Key
   `SURVEY_PANEL_TERMINATED_URL`, `SURVEY_PANEL_TERMINATED_BY_USER_URL`) and
   `SURVEY_PANEL_SHARED_SECRET`, which signs those passbacks.
 - `SURVEY_URL_SECRET`: signs survey URLs (`survey-agent sign-url <survey> uid=… rid=…`); the runtime
-  verifies signatures when a survey sets `settings.url_signing.required`.
+  verifies signatures when a survey sets `settings.url_signing.required`. Such a survey fails
+  closed: while the secret is unset or blank, every invitation to it gets a 403.
 - `SURVEY_ENRICH` (`static` | the reference warehouse adapter | import path).
 - `SURVEY_LAUNCH_APPROVAL_TOKEN`, `SURVEY_PREVIEW_TOKEN`, `SURVEY_SERVE_STATES`.
 - `SURVEY_PUBLIC_BASE_URL` (optional): the runtime derives its public URL from common hosts
@@ -218,8 +227,8 @@ needs:
 - **memory**: tests and throwaway runs only (lost on restart).
 - **file** (default): flat JSONL responses, JSON sessions, and quota files under `SURVEY_DATA_DIR`
   (default `./survey_data`). Inspectable, easy to back up or sync, zero infrastructure. Quota
-  reservations hold an OS file lock (POSIX, local disk), but sessions and responses are not locked
-  across processes, so run **one runtime process** on it.
+  reservations and response writes hold an OS file lock (POSIX, local disk), but sessions are not
+  locked across processes, so run **one runtime process** on it.
 - **sqlite**: one SQLite file, with quota increments that are **atomic and safe across threads and
   processes** (WAL mode). Still pure stdlib, no server. The step up from `file` for multiple workers
   on one box. Path via `SURVEY_SQLITE_PATH`. (Not for multiple *hosts*: SQLite over NFS is unsafe.)
@@ -233,14 +242,21 @@ needs:
   `record_response`, `find_respondent`, `erase_respondent`) on Postgres, DynamoDB, Redis, or your
   warehouse. For multiple hosts, use this or `mongo`.
 
-Two parts of the contract carry correctness guarantees:
+Three parts of the contract carry correctness guarantees:
 
-- **`reserve_quotas(survey_id, version, limits)`** increments every listed quota counter only if each
-  limited one is below its limit, atomically and all-or-nothing, and returns whether it reserved. A
-  completion reserves every bucket the session falls into; if any is full, the completion becomes the
-  survey's over-quota ending. The built-in stores provide it (`file` with an OS file lock, `sqlite` in
-  one transaction, `mongo` in a transaction or with compensating conditional increments). A store
-  without it gets a process-local fallback that is only correct for a single runtime process.
+- **`reserve_quotas(survey_id, version, limits, key=None)`** increments every listed quota counter
+  only if each limited one is below its limit, atomically and all-or-nothing, and returns whether it
+  reserved. A completion reserves every bucket the session falls into; if any is full, the completion
+  becomes the survey's over-quota ending. The runtime passes the response id as `key`: the store saves
+  the outcome with the counters, and a repeated call with the same key returns the first outcome
+  without taking another slot. The built-in stores provide it (`file` with an OS file lock, `sqlite` in
+  one transaction, `mongo` in a transaction or with compensating conditional increments, its outcomes
+  in a `quota_reservations` collection). A store without it gets a process-local fallback that is only
+  correct for a single runtime process; a store whose `reserve_quotas` doesn't accept `key` is called
+  without it and isn't idempotent across retries.
+- **`record_response(survey_id, response)`** is an upsert keyed by the response's `id`: recording the
+  same response again replaces it, so a retried or doubly processed completion never leaves two
+  records. (A record without an `id` is appended.)
 - **`find_respondent(id, id_fields, survey_id)` / `erase_respondent(...)`** match a respondent by value
   on any of the identity url variables in `id_fields`: responses on `url_variables`, sessions on
   `url_vars`, across every survey, partial sessions and retakes included. `erase_respondent` deletes
@@ -248,8 +264,22 @@ Two parts of the contract carry correctness guarantees:
   upload blobs and queued outbox deliveries. `delete_responses` remains as a compatibility wrapper.
 
 `survey-agent dsar <id> [--survey ID] --delete` uses these to erase a subject's responses, sessions,
-uploaded files and queued webhook deliveries uniformly. Backups, exports, passbacks already delivered,
+uploaded files and queued webhook deliveries uniformly. Before it deletes any record it writes an
+erasure job manifest (`$SURVEY_ERASURE_DIR`, default `<SURVEY_DATA_DIR>/erasure/`, file mode 0600)
+listing the upload refs and outbox keys still to remove, plus a hash of the subject id; no answers
+and no raw id. It ticks items off as they are removed and deletes the manifest when nothing is left.
+If a blob or outbox removal fails, the command exits non-zero and keeps the manifest; every later
+`dsar` run retries unfinished jobs first, and `dsar --resume` only retries. (No manifest is written
+when there's nothing outside the store to remove.) Backups, exports, passbacks already delivered,
 and any copies in your downstream systems remain your responsibility.
+
+**Completions are retry-safe.** At a terminal the runtime first saves the session with the ending it
+reached, then reserves quota (keyed by response id), then upserts the response, and only then marks
+the session recorded. If storage fails or the process dies part-way, the respondent's next request
+finishes the completion with the same outcome, one quota slot and one response record. Passbacks and
+webhooks run after the response is recorded and are best-effort: a failure is logged, not shown to the
+respondent. Two workers processing the same session can each fire the passback, always with the same
+idempotency key, so receivers should dedupe on it.
 
 > With the default `file` definition source, definitions are files in git; with a runtime definition
 > store (`SURVEY_DEFINITION_SOURCE=mongo` or `http`) they're published to the store (version-pinned,
@@ -317,7 +347,9 @@ Alarm on, at minimum:
 - **Passback failures.** A dropped passback means your system never hears that someone completed or
   screened out (missing records, miscounted quotas downstream). The built-in integrations make a
   single best-effort attempt per event, each carrying a stable `idempotency_key`, so your receiver
-  can dedupe safely. Watch delivery errors in the runtime logs and reconcile against the store
+  can dedupe safely (a completion retried after a failure, or handled by two workers, can repeat an
+  attempt with the same key). A failure is logged after the response is recorded and never reaches
+  the respondent. Watch delivery errors in the runtime logs and reconcile against the store
   (`survey-agent export`) when needed.
 - **Webhook-action outbox dead-letters** (if `SURVEY_OUTBOX=1`): `survey-agent outbox status`,
   `outbox list [--dead]`, and `outbox retry` inspect and drain pending and dead-lettered mid-survey
@@ -325,11 +357,14 @@ Alarm on, at minimum:
   because each intent has a stable id.
 - Runtime 5xx rates; database CPU and connections; LLM provider throttling where authoring/analysis runs.
 - Correlate logs by the hashed session / response id (`h:…`): log fields named `session_id` and
-  `response_id` are hashed, and `url` is reduced to scheme, host and path (`obs.py`).
+  `response_id` are hashed. A `url` field, and any field whose name ends in `_url`, is reduced to
+  `scheme://host[:port]#<fingerprint>`, where the fingerprint is the first 8 hex characters of the
+  full URL's SHA-256 (`obs.url_fingerprint`). The path, query and userinfo are never logged, because
+  webhook URLs often carry their secret in the path (`obs.py`).
 
 **Common ops:**
-- *Survey logic wrong after launch:* edit, cut a new version, re-publish; in-flight respondents are
-  unaffected.
+- *Survey logic wrong after launch:* edit, cut a new version, re-publish (or re-launch) with approval
+  so the new version is pinned; in-flight respondents are unaffected.
 - *Passbacks not landing:* check `SURVEY_INTEGRATION`, the integration's URLs, and its shared secret
   (`survey-agent doctor` shows the resolved config).
 - *Over-quota firing early:* check the store's quota counters against the survey's limits; confirm
@@ -354,7 +389,8 @@ Alarm on, at minimum:
   survey's declared `settings.url_variables` plus the identity variables; every captured param is
   still stored on the response. (The stdlib runtime has no abandon detection, so it never emits
   `terminated_by_user` itself; a plugin or host can.)
-- `webhook` **actions** fire once per session when their condition is true; the engine returns them as
+- `webhook` **actions** are decided once per session when their condition is true (with several
+  workers a delivery can repeat, under the same idempotency key); the engine returns them as
   intents and the runtime delivers them (durably with `SURVEY_OUTBOX=1`).
 - Export response shape: `{id, date_started, date_submitted, status, url_variables,
   survey_data{qid:{id,question,answer}}, derived{…}}`, where `id` is an opaque system-generated

@@ -47,7 +47,8 @@ the human's behalf; show them the checklist and let them supply it.
 2. **Make sure the hosted runtime has the survey: deploy (reachable) vs. live (open).** These are
    separate. `live` is the runtime's serving gate: `serve --public` serves respondents **only** surveys
    in a state listed in `SURVEY_SERVE_STATES` (default `live`), and anything earlier shows a "not open
-   yet" page. Marking live also pins the launched version.
+   yet" page. Marking live also pins the launched version (the newest saved one). Saving or editing a
+   definition never changes what is served; re-launching or re-publishing is what approves an edit.
    - With a runtime definition store (`SURVEY_DEFINITION_SOURCE=mongo` or `http`),
      `survey-agent publish` writes the definition to the store, so there's nothing to redeploy.
    - With the default `file` source, the file must also reach the hosted runtime. Run your deploy step
@@ -60,9 +61,11 @@ the human's behalf; show them the checklist and let them supply it.
    variables in `settings.url_variables` (and `settings.identity`) to match whatever names their
    system sends. If the parameters must not be forgeable, set `settings.url_signing.required` and mint
    per-respondent links with `survey-agent sign-url surveys/<slug>.survey.json uid=… rid=…`
-   (signed with `SURVEY_URL_SECRET`).
-4. **Freeze the version:** commit the `.survey.json` and `surveys/.versions/` (the immutable
-   version snapshots; `survey-agent publish` writes them). Definitions are immutable and versioned;
+   (signed with `SURVEY_URL_SECRET`). The hosted runtime needs the same secret: without it, a survey
+   that requires signing refuses every invitation.
+4. **Freeze the version:** commit the `.survey.json`, `surveys/.versions/` (the immutable version
+   snapshots; `launch` and `publish` write them) and `surveys/.registry.json` (the approved version)
+   together. A registry that pins a version whose snapshot isn't deployed makes the survey 404. Definitions are immutable and versioned;
    in-flight respondents stay pinned to the version they started, as long as the deployed runtime
    has that version's snapshot.
 5. Hand off to `survey-report` for monitoring.

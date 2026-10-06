@@ -31,7 +31,7 @@ closed AST evaluated by `engine/ast_eval.py`, with no `eval`/`exec` and a fixed 
 Regular expressions in logic and validation are rejected at validate time if longer than 200
 characters, built with nested unbounded quantifiers (`(x+)+`), or repeating an alternation
 (`(a|aa)+`). At run time they match at most 2,000 characters of input on the `regex` engine with a
-50 ms timeout per match. A match that times out is treated as no match in logic, and the check is skipped (answer accepted) in question validation, so a respondent is never blocked. Definitions must pass a JSON Schema
+50 ms timeout per match. A match that times out is treated as no match in logic, and the check is skipped (answer accepted) in question validation, so a respondent is never blocked. If the `regex` package is missing, survey patterns are refused the same way rather than run without a time limit. Definitions must pass a JSON Schema
 (`additionalProperties: false`) and a semantic lint before they run. This guarantee is about the
 **engine**; plugins you install (stores, integrations, enrichment providers) are ordinary Python code
 and run with your process's privileges.
@@ -44,7 +44,11 @@ live without the token. When it is unset, the local CLI/console can mark a surve
 connector and the API gateway cannot mark anything live at all. On the gateway, any registry write
 whose result is live, and that newly goes live or changes `status`, `live` or `live_version`, needs
 the token (`X-Survey-Launch-Approval` header or an `approve` field), and only the fields `status`,
-`note`, `project`, `live`, `live_version`, `validated` and `tested` are writable.
+`note`, `project`, `live`, `live_version`, `validated` and `tested` are writable. Saving a definition
+(`PUT /v1/definitions`) never changes what is served: the gateway validates the spec (422 with the
+errors) and stores a new version, and only an approved registry write moves `live_version`. Survey
+ids must match `^[A-Za-z0-9_-]+$`, and the `file` definition backend refuses any path outside its
+surveys directory.
 
 **Respondent sessions.** Each respondent session gets an opaque random token, rendered into the
 survey form. A submit must carry the session id *and* that token, and the session must belong to the
@@ -63,7 +67,11 @@ with no key configured, an offline stub runs and nothing leaves the machine. See
 **Transport integrity.** Webhook posts are HMAC-SHA256 signed (`SURVEY_WEBHOOK_SECRET`,
 `X-Survey-Signature: t=…,v1=…`, timestamp-checked on verify); panel passbacks are signed with
 `SURVEY_PANEL_SHARED_SECRET`. Inbound URL parameters can be signed with `survey-agent sign-url` and
-verified by the runtime (`SURVEY_URL_SECRET` + `settings.url_signing.required`). Terminal events
+verified by the runtime (`SURVEY_URL_SECRET` + `settings.url_signing.required`). The signature is an
+HMAC-SHA256 over a domain-separated canonical JSON of the sorted `[name, value]` pairs, so values
+can't shift a delimiter and a missing field never signs the same as an empty one. Signing fails
+closed: while `SURVEY_URL_SECRET` is unset or blank, a survey that requires signed links refuses every
+invitation (403), checked per request. Terminal events
 carry an idempotency key so receivers can dedupe. Passback events forward only the survey's declared
 `settings.url_variables` plus the identity variables; every captured parameter is still stored on the
 response.
@@ -75,7 +83,9 @@ and size rules, and must belong to a question on the respondent's current page, 
 stored; rejected uploads are deleted. Survey pages and data responses carry
 `Cache-Control: no-store`, and every runtime response carries `Referrer-Policy: no-referrer` and
 `X-Content-Type-Options: nosniff`. Logs carry hashed session and
-response ids, and URLs reduced to scheme, host and path.
+response ids. URLs (a `url` field or any field ending in `_url`) are reduced to
+`scheme://host[:port]#<8-hex fingerprint>`, never the path, query or userinfo, since webhook URLs
+often carry their secret in the path.
 
 **Access control is mostly yours.**
 - The **API gateway** (`survey-agent api`) runs **open, with no authentication, unless you configure

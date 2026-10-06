@@ -112,13 +112,15 @@ def test_url_signing_rejects_unsigned_and_accepts_signed():
         assert "Do you consent?" in html
 
 
-def test_url_signing_not_enforced_without_a_secret():
-    # required=true but no SURVEY_URL_SECRET configured → fail OPEN (with a startup warning), so a
-    # misconfiguration doesn't silently lock everyone out; the link still works.
+def test_url_signing_fails_closed_without_a_secret():
+    # required=true but no SURVEY_URL_SECRET configured → fail CLOSED: every invitation is refused
+    # (a startup warning says so), so a missing secret can never silently admit forged links.
     spec = _survey({"url_signing": {"required": True, "fields": ["uid", "rid", "group"]}})
     with running_server(spec) as base:
-        status, _ = _get(f"{base}/s/t_http?uid=1&rid=2&group=vip")
-        assert status == 200
+        import survey_agent.server as server
+        status, html = _get(f"{base}/s/t_http?uid=1&rid=2&group=vip")
+        assert status == 403 and "not configured" in html and "session_token" not in html
+        assert server.STORE.get_session_by_id("t_http:2:1") is None
 
 
 def _two_page_survey():

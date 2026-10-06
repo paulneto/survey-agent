@@ -147,12 +147,12 @@ leaves with `and` / `or`, and groups nest. Details in [LOGIC_IS_DATA.md](LOGIC_I
 |---|---|---|
 | Drop-in survey link | ✅ | `/s/<id>?uid=…&rid=…`; every query parameter is captured into `url_variables` |
 | Identity variables | ✅ | `settings.identity` names the respondent and response variables (default `uid` / `rid`) |
-| Signed links | ✅ | `survey-agent sign-url`; the runtime verifies when `settings.url_signing.required` is set and `SURVEY_URL_SECRET` is configured |
+| Signed links | ✅ | `survey-agent sign-url`; the runtime verifies when `settings.url_signing.required` is set, and refuses every invitation to that survey while `SURVEY_URL_SECRET` is unset |
 | Retake control | ✅ | `settings.retake`: `once` (default; an in-progress link resumes, a finished one is locked) or `multiple` |
 | Redirect on any terminal | ✅ | per-terminal `redirect`, or the `redirect` integration's per-status URLs with chosen URL variables appended |
 | Lifecycle passback | ✅ | `SURVEY_INTEGRATION`: `none` (default), `redirect`, `webhook`, `panel`, `mailchimp`, or your own import path; neutral events `started` / `completed` / `terminated` / `terminated_by_user` with an idempotency key |
 | Signed passbacks | ✅ | when a secret is set: `webhook` posts with `SURVEY_WEBHOOK_SECRET`, `panel` posts with `SURVEY_PANEL_SHARED_SECRET` |
-| Mid-survey webhook | ✅ | `webhook` action, gated by `when`, fires once per session; optional durable outbox (`SURVEY_OUTBOX=1`) for these actions |
+| Mid-survey webhook | ✅ | `webhook` action, gated by `when`, decided once per session (deliveries carry an idempotency key); optional durable outbox (`SURVEY_OUTBOX=1`) for these actions |
 | Abandonment detection | ⬜ | the stdlib runtime never emits `terminated_by_user` on its own |
 | Email notifications | ⬜ | no send-email integration; write one against the integration seam |
 | Conversational delivery | ◑ | the same survey runs as a chat (MCP `begin_survey`, plus the `convo` and `/chat` previews, which record nothing); grids, rankings and file uploads aren't supported in chat — use the form for those. See [AGENTIC_MODES.md](AGENTIC_MODES.md) |
@@ -179,7 +179,7 @@ leaves with `and` / `or`, and groups nest. Details in [LOGIC_IS_DATA.md](LOGIC_I
 | Tabular export | ✅ | `survey-agent export --format csv\|parquet` |
 | Canonical response record | ✅ | stable export shape: `id`, dates, `status`, `url_variables`, `survey_data`, `derived` |
 | Cross-tabs | ◑ | not built in; export and cross-tab in your own tools |
-| Backup / restore | ✅ | `survey-agent backup` / `restore` |
+| Backup / restore | ✅ | `survey-agent backup` / `restore` (restore never duplicates a response) |
 
 ## Lifecycle and operations
 
@@ -190,10 +190,10 @@ leaves with `and` / `or`, and groups nest. Details in [LOGIC_IS_DATA.md](LOGIC_I
 | Persona pre-test | ✅ | `pretest`, optionally against a declared audience. See [PERSONAS.md](PERSONAS.md) |
 | Methodology critique | ✅ | `critique`; advisory |
 | Markdown authoring | ✅ | `compile` turns a `.md` survey into JSON |
-| Versioning | ◑ | each survey carries a `version`, and quota counts are kept per version. changed content always gets a new version number, and in-progress respondents finish on the version they started. The `file` source keeps snapshots in `surveys/.versions/` (commit them); `mongo` keeps every version in the store |
+| Versioning | ◑ | each survey carries a `version`, and quota counts are kept per version. changed content always gets a new version number, and in-progress respondents finish on the version they started. Saving a version never changes what is served: only an approved mark-live moves `live_version`. The `file` source keeps snapshots in `surveys/.versions/` (commit them with `surveys/.registry.json`); `mongo` keeps every version in the store |
 | Templates | ✅ | `templates`, `new`, `copy`, `templatize` |
 | Serving gate | ✅ | `serve --public` serves only `live` surveys (`SURVEY_SERVE_STATES` to change); others show a "not open yet" page |
-| Pause / close | ✅ | `survey-agent status <id> --set paused\|closed`; `--set live` resumes |
+| Pause / close | ✅ | `survey-agent status <id> --set paused\|closed`; `--set live` resumes (and pins the newest saved version) |
 | Launch approval | ✅ | with `SURVEY_LAUNCH_APPROVAL_TOKEN` set, nothing marks a survey live without the token; the MCP connector always requires it |
 | Deploy hook | ✅ | `launch --deploy` runs your configured `deploy.command` |
 | Storage backends | ✅ | `SURVEY_STORE`: `file` (default), `memory`, `sqlite`, `mongo`, `http`, or your own |
@@ -205,7 +205,7 @@ leaves with `and` / `or`, and groups nest. Details in [LOGIC_IS_DATA.md](LOGIC_I
 | Capability | Status | Notes |
 |---|---|---|
 | No code in survey definitions | ✅ | the engine interprets a closed logic language; there is no `eval` |
-| Data-subject requests | ✅ | `survey-agent dsar <id>` finds a respondent's responses and sessions (matched on every identity variable in use) and, with `--delete`, erases them plus uploaded files and queued webhook deliveries; passbacks already sent, backups and downstream copies are yours to handle |
+| Data-subject requests | ✅ | `survey-agent dsar <id>` finds a respondent's responses and sessions (matched on every identity variable in use) and, with `--delete`, erases them plus uploaded files and queued webhook deliveries, with a resumable job manifest (`dsar --resume`); passbacks already sent, backups and downstream copies are yours to handle |
 | Rate limiting | ◑ | opt-in, per instance (`SURVEY_RATE_LIMIT`); use a load balancer or WAF for a global cap |
 | Client metadata capture | ◑ | opt-in (`SURVEY_CAPTURE_CLIENT_META`): IP, user agent and a browser fingerprint stored on the response for your own fraud review |
 | Anti-fraud settings | ◑ | `settings.anti_fraud` (`attention_checks`, `min_page_seconds`, `block_duplicate_uid`) is declared but not enforced by the engine yet; write an attention check as an ordinary screen-out rule |

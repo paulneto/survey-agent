@@ -21,6 +21,14 @@ First public release.
   `surveys/.versions/<id>/v<N>.survey.json`. Identical content keeps its version; changed content
   never reuses a number. If a session's version is no longer available, the respondent is asked to
   reopen their link, which restarts them on the live version.
+- Saving a definition never changes what respondents are served. The registry reports the approved
+  `live_version` and the newest saved `latest_version` separately, and only an approved mark-live
+  (`launch`, `publish`, `status --set live`, the console's Mark live, a gated gateway registry write)
+  moves `live_version`; one that names no version pins the newest saved one. With `file` definitions,
+  an edited file keeps serving the approved snapshot until it is launched or published, so
+  `surveys/.registry.json` and `surveys/.versions/` deploy together.
+- Survey ids must match `^[A-Za-z0-9_-]+$`, and the `file` definition backend refuses paths outside
+  its surveys directory.
 - Question types: radio, checkbox (with an exclusive "none of the above"), dropdown, multi-select
   dropdown, short text (regex / email / phone / length / `min_words`), long text, number
   (min/max/percent), rating / Likert, NPS, ranking, grid / matrix (radio or checkbox cells), date, and
@@ -31,7 +39,8 @@ First public release.
   disqualify / screen-out, per-option and grid-row logic, nested AND/OR, and a fixed operator set.
   Regular expressions are length- and complexity-bounded at validate time (no nested unbounded
   quantifiers or repeated alternations), run on the `regex` engine (a core dependency) with a 50 ms
-  timeout per match, and match at most 2,000 characters of input.
+  timeout per match, and match at most 2,000 characters of input. If `regex` is missing, survey
+  patterns are refused rather than run unbounded.
 - Piping and merge tokens for answers, URL variables, variables and context facts (`{{q:…}}`,
   `{{url:…}}`, `{{var:…}}`, `{{ctx:…}}`), with fallbacks (`{{q:q_fav|your favourite}}`) and option
   piping that carries selected options forward. Piped values are shown as plain text.
@@ -41,7 +50,7 @@ First public release.
 - Seeded, per-session randomization with locked positions; overall and per-option quotas, where a
   completion atomically reserves every bucket it falls into and becomes the over-quota ending if any
   is full; hidden values and calculations (score / sum / bucket / count / arithmetic) usable in
-  logic, piping, quotas and routing; mid-survey webhook actions (fire once per session, HMAC-signed).
+  logic, piping, quotas and routing; mid-survey webhook actions (decided once per session, idempotency-keyed, HMAC-signed).
 - `settings.identity` names the URL variables that carry respondent and response identity (default
   `uid` and `rid`); `settings.retake` (`once` or `multiple`) controls whether an invite link can be
   taken again.
@@ -62,10 +71,16 @@ First public release.
   serves drafts locally; `demo` runs the runtime with a mock receiver.
 - Respondent sessions carry an opaque per-session token; a submit must match it and the survey in the
   URL, and the invite link is how a respondent resumes. A session's ending is processed once.
+- Retry-safe completions: quota reservation is keyed by the response id (a repeat returns the
+  original outcome), responses are upserted by id on every built-in store, the session is marked
+  recorded only after the write succeeds, and a completion interrupted part-way is finished on the
+  respondent's next request. Passbacks and webhooks run after the response is recorded and are
+  best-effort: a failure is logged, not shown to the respondent, and a repeat carries the same
+  idempotency key.
 - Request limits (`SURVEY_MAX_BODY_BYTES`, default 10 MB; `SURVEY_REQUEST_TIMEOUT`, default 30 s),
   `Cache-Control: no-store` on survey pages and data, `Referrer-Policy: no-referrer` and
-  `X-Content-Type-Options: nosniff`, and logs that hash session/response ids and strip query strings
-  from URLs.
+  `X-Content-Type-Options: nosniff`, and logs that hash session/response ids and reduce URLs (`url`
+  and any `*_url` field) to `scheme://host[:port]#<fingerprint>`, never the path, query or userinfo.
 - Lifecycle states (draft → validated → tested → approved → live → paused / closed), tracked in a
   registry sidecar; only serving states reach respondents, and `paused` / `closed` stop fielding.
 - Conversational delivery: the same survey administered as a chat, with the engine deciding flow,
@@ -73,7 +88,10 @@ First public release.
   browser `/chat` (served only in demo/preview mode or with `SURVEY_CHAT_DEMO=1`) are previews that
   record nothing; agents collect answers with `begin_survey` / `answer_survey`.
 - Signed URL parameters (`sign-url`, `settings.url_signing.required`) so eligibility values can't be
-  edited in the address bar.
+  edited in the address bar. The signature is an HMAC over a domain-separated canonical JSON of the
+  sorted `[name, value]` pairs (a missing field differs from an empty one; `sign-url` refuses blank
+  values). Signing fails closed: while `SURVEY_URL_SECRET` is unset or blank, a survey that requires
+  it refuses every invitation (403), and the startup preflight names the affected surveys.
 - A human launch gate: when `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, no surface can mark a survey live
   without it; the MCP connector and the API gateway always require it.
 
@@ -103,7 +121,9 @@ First public release.
   identity variable in use (`--id-field` adds more; `--json --full` gives the access copy), and
   `--delete` erases them along with their uploaded files and queued webhook deliveries. Copies
   delivered outside the app (passbacks, backups, exports, logs, warehouses) must be erased there.
-  `backup` / `restore` for responses; `defs-export` / `defs-import` / `defs-diff` for definitions.
+  Erasure writes a durable job manifest first (no answers, no raw subject id); a failed blob or
+  outbox removal exits non-zero and keeps it, and the next `dsar` run (or `dsar --resume`) retries.
+  `backup` / `restore` for responses (restore never duplicates a response); `defs-export` / `defs-import` / `defs-diff` for definitions.
 - `doctor` (resolved install, configuration and deployment checks), `help`, `docs`, `init`,
   `selftest`.
 
@@ -124,6 +144,8 @@ First public release.
   Session cookies are honoured only with Google sign-in and a strong `SURVEY_SESSION_JWT_KEY` (the
   gateway refuses to start with a weak one, or without `[auth]` installed). Registry writes accept an
   allowlist of fields, and any write that makes or changes what is live needs the launch approval.
+  `PUT /v1/definitions` validates the spec (422 with the errors; the body is `{"survey": {...}}`) and
+  never changes what is live.
 
 **Hosting**
 - A Dockerfile, a `Procfile`, Render blueprints, a Fly.io config and reference Terraform. The runtime

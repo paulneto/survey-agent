@@ -28,9 +28,9 @@ Store interface (all backends implement):
   get_session_by_id(session_id) -> session | None
   quota_counts(survey_id, version) -> {quota_id: int}
   incr_quota(survey_id, version, quota_id) -> int           # new count (atomic per backend)
-  record_response(survey_id, response)                      # append-only export record
+  record_response(survey_id, response)                      # UPSERT keyed by response["id"]
   list_responses(survey_id=None, uid=None, id_fields=None) -> [response]
-  reserve_quotas(survey_id, version, limits) -> bool         # all-or-nothing capacity reservation
+  reserve_quotas(survey_id, version, limits, key=None) -> bool  # all-or-nothing, idempotent per key
   find_respondent(respondent_id, id_fields=("uid",), survey_id=None) -> {responses, sessions}
   erase_respondent(respondent_id, id_fields=("uid",), survey_id=None)
       -> {responses: n, sessions: m, upload_refs: [ref], webhook_keys: [key]}
@@ -39,7 +39,14 @@ Store interface (all backends implement):
 Quota reservation: `limits` is {quota_id: limit_or_None}. The store increments EVERY listed counter
 iff each limited counter is currently below its limit — atomically, all-or-nothing (no partial
 increments). Returns True when reserved, False when any limited bucket is full. `incr_quota` stays as
-the unconditional single-counter primitive.
+the unconditional single-counter primitive. With `key` (the runtime passes the response id) the store
+persists the outcome atomically with the counters, and a repeated call with the same key — a retry, or
+a second worker processing the same session — returns that first outcome without incrementing again.
+
+Response records: `record_response` is an upsert keyed by the record's `id` (the response id) — a
+terminal re-recorded after a failure, or by two workers, must never yield two records with one id. A
+record without an `id` is simply appended. The runtime's terminal ordering (
+server.on_terminal) relies on both properties: reserve(key) → record (upsert) → mark recorded.
 
 Respondent erasure (DSAR): a respondent is matched by value against any of `id_fields` — the url
 variable names that carry a person's id (`uid` by default; surveys can rename it with

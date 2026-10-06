@@ -82,6 +82,7 @@ survey-agent list                         # management view
 survey-agent status <id> [--set STATE]    # show or set one survey's lifecycle state
 survey-agent doctor                       # resolved install + config self-diagnosis
 survey-agent dsar <id> [--delete]         # find/erase a subject's data: responses, sessions, uploads (DSAR)
+survey-agent dsar --resume                # retry erasure jobs a failed --delete left behind
 survey-agent backup / restore <file>      # portable JSONL cold backup of responses
 survey-agent outbox status|list|retry     # drain the durable webhook outbox (SURVEY_OUTBOX=1)
 ```
@@ -126,9 +127,11 @@ parsing results programmatically. The exit code is non-zero when a gate fails.
   grids, rankings and file uploads aren't supported in conversation, so keep surveys meant for chat
   to those types. `convo` and the browser `/chat` are previews that record nothing; `begin_survey` /
   `answer_survey` return the structured result to you.
-- **Definitions are immutable + versioned.** Editing publishes a new version; in-flight sessions stay
-  pinned to theirs. With file definitions, commit `surveys/.versions/` (the version snapshots) along
-  with the survey.
+- **Definitions are immutable + versioned.** Editing saves a new version; in-flight sessions stay
+  pinned to theirs. **Saving never changes what respondents are served**: the registry's
+  `live_version` moves only with an approved mark-live (`launch`, `publish`, `status --set live`), and
+  `latest_version` shows the newest saved one. With file definitions, commit `surveys/.versions/` (the
+  version snapshots) and `surveys/.registry.json` (the approved pin) together with the survey.
 
 See [docs/ENGINEERING.md](docs/ENGINEERING.md) for the full architecture and
 [skills/author-survey/SKILL.md](skills/author-survey/SKILL.md) for the authoring playbook.

@@ -37,14 +37,16 @@ A survey moves through clear stages. Each stage names *who* does it — **consol
    respondents **only when a survey is live**
    (and by a separate **runtime** at `/s/<id>`, not the console). A pre-live survey shows respondents a
    *"not open yet"* page; only an operator can **preview** it. Marking live also **pins the launched
-   version**. Running `survey-agent console` starts a local preview runtime (and a preview token) so
+   version** (the newest saved one); saving a later edit doesn't change what respondents get until
+   the survey is marked live or published again. Running `survey-agent console` starts a local preview runtime (and a preview token) so
    **↗ As respondent** works immediately on any state; for real fielding, run `survey-agent serve --multi`
    (or point `SURVEY_PUBLIC_BASE_URL` at your hosted runtime).
 6. **Operate** *(console)*. Watch the board (completes, incidence, status); **pause / resume / close**
    in one click (no redeploy on a runtime store); pull **responses** (CSV); open the all-surveys
    **Dashboard ↗** (params, quotas, live links, counts).
-7. **Iterate** *(agent → publish)*. Edit, re-`publish` — the version auto-bumps; respondents mid-survey
-   keep their pinned version.
+7. **Iterate** *(agent → publish)*. Edit, re-`publish` — the version auto-bumps and the approved
+   publish pins it; respondents mid-survey keep their pinned version. An edit saved without an
+   approved publish or Mark live isn't served.
 8. **Retire** *(console)*. **Close** it (respondents see a closed page), or **Delete** it (detail →
    🗑 Delete, type the id to confirm). Delete removes the **definition + lifecycle**; the **collected
    responses are kept** in the response store for export/retention.

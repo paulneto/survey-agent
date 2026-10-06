@@ -3,13 +3,15 @@
 Great for local/dev/single-box/low-volume and for keeping responses as inspectable, S3-syncable
 files. Quota updates (`incr_quota`, `reserve_quotas`) hold a thread lock plus an OS file lock (fcntl,
 POSIX) around the read-check-write, so they're safe across threads and — on POSIX, on a local disk —
-across processes on one box. Sessions/responses are not locked across processes: for multiple workers
-use sqlite (one box) or mongo / your own store (many hosts).
+across processes on one box; `reserve_quotas(key=...)` persists its idempotency key in the same write.
+Response writes are an upsert by response id under the same kind of lock. Sessions are not locked
+across processes: for multiple workers use sqlite (one box) or mongo / your own store (many hosts).
 
 Layout (data_dir, default ./survey_data):
   sessions/<sha1(session_id)>.json
-  quotas/<survey_id>_v<version>.json        {quota_id: count}
-  responses/<survey_id>.jsonl               append-only export records
+  quotas/<survey_id>_v<version>.json        {"counts": {quota_id: count}, "reservations": {key: bool}}
+                                            (a legacy flat {quota_id: count} file is still read)
+  responses/<survey_id>.jsonl               export records, one per response id (upsert by id)
 """
 import contextlib
 import hashlib
@@ -91,16 +93,26 @@ class FileStore:
                 f.close()
 
     @staticmethod
-    def _read_counts(f):
+    def _read_state(f):
+        """(counts, reservations) from a locked quota file. Reads the legacy flat {quota_id: count}
+        format too; reservations are the idempotency keys of reserve_quotas(key=...) → result."""
         f.seek(0)
         raw = f.read().strip()
-        return json.loads(raw) if raw else {}
+        data = json.loads(raw) if raw else {}
+        if isinstance(data.get("counts"), dict) and "reservations" in data:
+            return dict(data["counts"]), dict(data.get("reservations") or {})
+        return dict(data), {}
 
     @staticmethod
-    def _write_counts(f, counts):
+    def _read_counts(f):
+        return FileStore._read_state(f)[0]
+
+    @staticmethod
+    def _write_state(f, counts, reservations):
+        """Counts and reservation keys in ONE file write, so they can never disagree."""
         f.seek(0)
         f.truncate()
-        f.write(json.dumps(counts))
+        f.write(json.dumps({"counts": counts, "reservations": reservations}))
         f.flush()
         os.fsync(f.fileno())
 
@@ -113,30 +125,68 @@ class FileStore:
 
     def incr_quota(self, survey_id, version, quota_id):
         with self._lock, self._locked(self._quota_path(survey_id, version)) as f:
-            counts = self._read_counts(f)
+            counts, res = self._read_state(f)
             counts[quota_id] = counts.get(quota_id, 0) + 1
-            self._write_counts(f, counts)
+            self._write_state(f, counts, res)
             return counts[quota_id]
 
-    def reserve_quotas(self, survey_id, version, limits):
+    def reserve_quotas(self, survey_id, version, limits, key=None):
         """All-or-nothing: increment every bucket in `limits` iff each limited one is below its limit.
-        One locked read-check-write of the survey-version's counter file."""
-        if not limits:
+        One locked read-check-write of the survey-version's counter file. With `key` (the response id)
+        the result is recorded in the same write, and a repeated call returns it without incrementing."""
+        if not limits and key is None:
             return True
         with self._lock, self._locked(self._quota_path(survey_id, version)) as f:
-            counts = self._read_counts(f)
-            if not check_reservation(counts, limits):
-                return False
-            for qid in limits:
-                counts[qid] = counts.get(qid, 0) + 1
-            self._write_counts(f, counts)
-            return True
+            counts, res = self._read_state(f)
+            if key is not None and str(key) in res:
+                return bool(res[str(key)])
+            ok = check_reservation(counts, limits)
+            if ok:
+                for qid in (limits or {}):
+                    counts[qid] = counts.get(qid, 0) + 1
+            if key is not None:
+                res[str(key)] = ok
+            if ok or key is not None:
+                self._write_state(f, counts, res)
+            return ok
 
-    # ---- responses (append-only) ----
+    # ---- responses (one record per response id) ----
+    def _responses_lock_path(self, survey_id):
+        # a sidecar lock file: the responses file itself is replaced (new inode) on a rewrite
+        return os.path.join(self.dir, "responses", f".{survey_id}.lock")
+
     def record_response(self, survey_id, response):
-        with self._lock:
-            with open(self._responses_path(survey_id), "a") as f:
-                f.write(json.dumps(response) + "\n")
+        """Upsert keyed by the response `id`: a new id is appended; a re-recorded id (a terminal retried
+        after a failure, or processed by two workers) rewrites that one line in place (tmp file +
+        os.replace) — never two records with one id. Held under the thread lock + an OS file lock."""
+        path = self._responses_path(survey_id)
+        rid = response.get("id")
+        line = json.dumps(response) + "\n"
+        with self._lock, self._locked(self._responses_lock_path(survey_id)):
+            if rid is not None and os.path.exists(path):
+                lines, found = [], False
+                with open(path) as f:
+                    for raw in f:
+                        if not raw.strip():
+                            continue
+                        if json.loads(raw).get("id") == rid:
+                            if not found:                  # replace in place (keeps file order)
+                                lines.append(line)
+                                found = True
+                            continue                       # (heal) drop any older duplicate of this id
+                        lines.append(raw if raw.endswith("\n") else raw + "\n")
+                if found:
+                    tmp = path + ".tmp"
+                    with open(tmp, "w") as f:
+                        f.writelines(lines)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                    return
+            with open(path, "a") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
 
     def count_responses_by_survey(self):
         """Status tallies for every survey in one pass over the response files (the id is the filename
@@ -205,20 +255,28 @@ class FileStore:
         Atomic per file (write tmp, then os.replace). Caller holds self._lock."""
         dropped = []
         for path in self._response_files(survey_id):
-            kept = []
-            with open(path) as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    r = json.loads(line)
-                    if keep(r):
-                        kept.append(line if line.endswith("\n") else line + "\n")
-                    else:
-                        dropped.append(r)
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                f.writelines(kept)
-            os.replace(tmp, path)
+            sid = os.path.basename(path)[: -len(".jsonl")]
+            with self._locked(self._responses_lock_path(sid)):
+                dropped += self._drop_from_file(path, keep)
+        return dropped
+
+    @staticmethod
+    def _drop_from_file(path, keep):
+        """Rewrite one responses file keeping rows where keep(row); returns the dropped rows."""
+        kept, dropped = [], []
+        with open(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                if keep(r):
+                    kept.append(line if line.endswith("\n") else line + "\n")
+                else:
+                    dropped.append(r)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.writelines(kept)
+        os.replace(tmp, path)
         return dropped
 
     def erase_respondent(self, respondent_id, id_fields=("uid",), survey_id=None):

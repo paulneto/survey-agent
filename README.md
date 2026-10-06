@@ -117,16 +117,18 @@ There's also a distinct third entry point:
   (`SURVEY_STORE=your_pkg:YourStore`) or use the reference `mongo` backend. Completion integrations
   (`none` by default, `redirect` browser passback, `webhook`, a generic `panel` passback, a reference
   `mailchimp` adapter, or your own plugin) and themes plug in the same way.
-- **Built for trust and ops.** Definitions are immutable and versioned. Webhooks are HMAC-signed, and
-  URL params can be too: sign `uid`/`rid`/`group` so eligibility can't be edited in the address bar
-  (mint links with `survey-agent sign-url`; the runtime verifies them when
-  `settings.url_signing.required` is set). Launch is human-gated by an approval token (see
+- **Built for trust and ops.** Definitions are immutable and versioned, and saving a new version
+  never changes what respondents are served until a human-approved launch or publish pins it.
+  Webhooks are HMAC-signed, and URL params can be too: sign `uid`/`rid`/`group` so eligibility can't
+  be edited in the address bar (mint links with `survey-agent sign-url`; the runtime verifies them
+  when `settings.url_signing.required` is set, and refuses every invitation while no secret is
+  configured). A completion is recorded once even if it is retried. Launch is human-gated by an approval token (see
   [Use it inside your LLM](#use-it-inside-your-llm-file-access-surfaces)). A per-survey
   `settings.retake` (`once` by default, or `multiple`) controls whether one invite link can be taken
   again. `survey-agent dsar <id>` finds everything the app holds for a respondent (responses and
   sessions, on every identity variable in use) and `--delete` erases it, including their uploaded
-  files and queued webhook deliveries; copies already sent or exported elsewhere remain yours to
-  handle.
+  files and queued webhook deliveries (a failed removal is kept as a job that `dsar --resume`
+  retries); copies already sent or exported elsewhere remain yours to handle.
 
 ### Survey mechanics the engine guarantees
 

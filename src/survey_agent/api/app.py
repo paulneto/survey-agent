@@ -193,14 +193,39 @@ def get_definition(survey_id: str, version: int = Query(None)):
     return spec
 
 
+def _check_id(survey_id: str) -> None:
+    from survey_agent.definitions.base import valid_survey_id
+    if not valid_survey_id(survey_id):
+        raise HTTPException(status_code=400, detail="invalid survey id: use letters, digits, '_' and '-' only")
+
+
 @v1.put("/definitions")
 async def put_definition(request: Request):
-    spec = await request.json()
+    """Save a definition. It is validated here (the backends never see an invalid spec) and saving
+    NEVER changes what is live: the new version becomes `latest_version`; only an approved registry
+    write (POST /v1/registry/{id}) moves `live_version`."""
+    try:
+        spec = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail={"errors": ["body is not valid JSON"]})
+    if not isinstance(spec, dict) or not isinstance(spec.get("survey"), dict):
+        raise HTTPException(status_code=422, detail={"errors": ["a definition is a JSON object {\"survey\": {...}}"]})
+    from survey_agent.engine.validate import validate
+    try:
+        errs = [e for e in validate(spec) if not str(e).startswith("[warn]")]
+    except Exception as e:                     # a spec malformed enough to trip the validator itself
+        errs = [f"definition could not be validated: {type(e).__name__}"]
+    from survey_agent.definitions.base import valid_survey_id
+    if not valid_survey_id(spec["survey"].get("id")):
+        errs.append("survey.id must match ^[A-Za-z0-9_-]+$")   # enforced here even if the schema drifts
+    if errs:
+        raise HTTPException(status_code=422, detail={"errors": errs})
     return {"version": _defs().put_definition(spec)}
 
 
 @v1.delete("/definitions/{survey_id}")
 def delete_definition(survey_id: str):
+    _check_id(survey_id)
     _defs().delete_definition(survey_id)
     return {"ok": True}
 
@@ -258,6 +283,7 @@ async def set_registry(survey_id: str, request: Request):
         raise HTTPException(status_code=400, detail="registry update must be a JSON object")
     fields = dict(body)
     approve = fields.pop("approve", None) or request.headers.get("x-survey-launch-approval")
+    _check_id(survey_id)
     _check_registry_fields(fields)
     # Gate on the RESULTING state, not just an explicit `status: live` — the registry also derives
     # `live` from signals like `live.at`, so judge the merged entry exactly as the store will see it.
@@ -270,6 +296,9 @@ async def set_registry(survey_id: str, request: Request):
         ok, reason = may_mark_live(approve, surface="api")
         if not ok:
             raise HTTPException(status_code=403, detail=reason)
+    if isinstance(fields.get("live_version"), int) and \
+            _defs().get_definition(survey_id, version=fields["live_version"]) is None:
+        raise HTTPException(status_code=400, detail=f"no version {fields['live_version']} of {survey_id!r}")
     _defs().set_registry(survey_id, **fields)
     return _defs().get_registry(survey_id) or {}
 

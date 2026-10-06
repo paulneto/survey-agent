@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .base import DefinitionStore
+from .base import DefinitionStore, check_survey_id, valid_survey_id
 
 
 class HTTPDefinitionStore(DefinitionStore):
@@ -39,18 +39,24 @@ class HTTPDefinitionStore(DefinitionStore):
         return urllib.parse.quote(sid, safe="")
 
     def get_definition(self, survey_id, version=None):
-        suffix = f"?version={version}" if version is not None else ""
+        if not valid_survey_id(survey_id):
+            return None
+        suffix = f"?version={int(version)}" if version is not None else ""
         return self._req("GET", f"/v1/definitions/{self._q(survey_id)}{suffix}")
 
     def put_definition(self, spec):
+        check_survey_id(((spec or {}).get("survey") or {}).get("id"))
         return (self._req("PUT", "/v1/definitions", body=spec) or {}).get("version")
 
     def get_registry(self, survey_id):
+        if not valid_survey_id(survey_id):
+            return None
         return self._req("GET", f"/v1/registry/{self._q(survey_id)}")
 
     def set_registry(self, survey_id, **fields):
         # Marking live is gated on the gateway too: forward the launch approval this process was given
         # (config.may_mark_live records it after checking `--approve` locally).
+        check_survey_id(survey_id)
         from survey_agent.config import approved_launch_token
         tok = approved_launch_token()
         # The gateway gates any lifecycle write that touches status / live / live_version (anything that can
@@ -63,8 +69,11 @@ class HTTPDefinitionStore(DefinitionStore):
         return self._req("GET", "/v1/surveys") or []
 
     def iter_versions(self, survey_id):
+        if not valid_survey_id(survey_id):
+            return []
         return [tuple(v) for v in (self._req("GET", f"/v1/definitions/{self._q(survey_id)}/versions") or [])]
 
     def delete_definition(self, survey_id):
+        check_survey_id(survey_id)
         self._req("DELETE", f"/v1/definitions/{self._q(survey_id)}")
         return True

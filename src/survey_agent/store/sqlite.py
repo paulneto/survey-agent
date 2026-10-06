@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS quotas (
     PRIMARY KEY (survey_id, version, quota_id)
 );
 CREATE TABLE IF NOT EXISTS responses (
-    seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+    seq       INTEGER PRIMARY KEY AUTOINCREMENT,         -- + response_id TEXT UNIQUE (see _migrate)
     survey_id TEXT NOT NULL,
     uid       TEXT,
     status    TEXT,
@@ -44,7 +44,35 @@ CREATE TABLE IF NOT EXISTS responses (
 );
 CREATE INDEX IF NOT EXISTS idx_responses_survey ON responses (survey_id);
 CREATE INDEX IF NOT EXISTS idx_responses_survey_uid ON responses (survey_id, uid);
+CREATE TABLE IF NOT EXISTS quota_reservations (
+    survey_id TEXT NOT NULL,
+    version   INTEGER NOT NULL,
+    key       TEXT NOT NULL,
+    ok        INTEGER NOT NULL,
+    PRIMARY KEY (survey_id, version, key)
+);
 """
+
+
+def _migrate(c):
+    """Add the `response_id` column + its UNIQUE index to a database created before responses were
+    keyed (idempotent). Pre-existing rows are backfilled from their JSON `id` — the first row per id
+    only, so a legacy duplicate can't block the unique index (later copies stay NULL-keyed)."""
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(responses)")}
+    if "response_id" not in cols:
+        try:
+            c.execute("ALTER TABLE responses ADD COLUMN response_id TEXT")
+        except sqlite3.OperationalError as e:   # a concurrent worker migrated first
+            if "duplicate column" not in str(e).lower():
+                raise
+        try:
+            c.execute("UPDATE responses SET response_id = json_extract(data, '$.id') "
+                      "WHERE response_id IS NULL AND json_extract(data, '$.id') IS NOT NULL "
+                      "AND seq = (SELECT MIN(r2.seq) FROM responses r2 "
+                      "WHERE json_extract(r2.data, '$.id') = json_extract(responses.data, '$.id'))")
+        except sqlite3.OperationalError:   # pragma: no cover — sqlite built without JSON1
+            pass
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_responses_response_id ON responses (response_id)")
 
 
 class SQLiteStore:
@@ -55,6 +83,7 @@ class SQLiteStore:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            _migrate(c)
 
     @contextlib.contextmanager
     def _conn(self):
@@ -127,38 +156,55 @@ class SQLiteStore:
             c.execute("COMMIT")
             return row["count"]
 
-    def reserve_quotas(self, survey_id, version, limits):
+    def reserve_quotas(self, survey_id, version, limits, key=None):
         """All-or-nothing: increment every bucket in `limits` iff each limited one is below its limit.
         One BEGIN IMMEDIATE transaction (takes the write lock up front), so the check and the increments
-        are atomic across threads and processes."""
-        if not limits:
+        are atomic across threads and processes. With `key` (the response id) the outcome is stored in
+        `quota_reservations` in the SAME transaction, and a repeated call — from any worker — returns
+        it without incrementing again."""
+        if not limits and key is None:
             return True
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
             try:
+                if key is not None:
+                    row = c.execute("SELECT ok FROM quota_reservations WHERE survey_id=? AND version=? "
+                                    "AND key=?", (survey_id, version, str(key))).fetchone()
+                    if row is not None:
+                        c.execute("ROLLBACK")
+                        return bool(row["ok"])
                 rows = c.execute("SELECT quota_id, count FROM quotas WHERE survey_id=? AND version=?",
                                  (survey_id, version)).fetchall()
-                if not check_reservation({r["quota_id"]: r["count"] for r in rows}, limits):
-                    c.execute("ROLLBACK")
-                    return False
-                for qid in limits:
-                    c.execute("INSERT INTO quotas (survey_id, version, quota_id, count) VALUES (?, ?, ?, 1) "
-                              "ON CONFLICT(survey_id, version, quota_id) DO UPDATE SET count=count+1",
-                              (survey_id, version, qid))
+                ok = check_reservation({r["quota_id"]: r["count"] for r in rows}, limits)
+                if ok:
+                    for qid in (limits or {}):
+                        c.execute("INSERT INTO quotas (survey_id, version, quota_id, count) "
+                                  "VALUES (?, ?, ?, 1) ON CONFLICT(survey_id, version, quota_id) "
+                                  "DO UPDATE SET count=count+1", (survey_id, version, qid))
+                if key is not None:
+                    c.execute("INSERT INTO quota_reservations (survey_id, version, key, ok) "
+                              "VALUES (?, ?, ?, ?)", (survey_id, version, str(key), int(ok)))
                 c.execute("COMMIT")
-                return True
+                return ok
             except BaseException:
                 if c.in_transaction:
                     c.execute("ROLLBACK")
                 raise
 
-    # ---- responses (append-only) ----
+    # ---- responses (one row per response id) ----
     def record_response(self, survey_id, response):
+        """Upsert keyed by the response `id` (UNIQUE `response_id`): a re-recorded terminal — retried
+        after a failure, or processed by two workers — replaces its row, never adds a second one. A
+        record without an id is appended."""
         uid = (response.get("url_variables") or {}).get("uid")
+        rid = response.get("id")
         with self._conn() as c:
-            c.execute("INSERT INTO responses (survey_id, uid, status, data) VALUES (?, ?, ?, ?)",
-                      (survey_id, None if uid is None else str(uid),
-                       response.get("status"), json.dumps(response)))
+            c.execute("INSERT INTO responses (survey_id, uid, status, data, response_id) "
+                      "VALUES (?, ?, ?, ?, ?) ON CONFLICT(response_id) DO UPDATE SET "
+                      "survey_id=excluded.survey_id, uid=excluded.uid, status=excluded.status, "
+                      "data=excluded.data",
+                      (survey_id, None if uid is None else str(uid), response.get("status"),
+                       json.dumps(response), None if rid is None else str(rid)))
 
     def count_responses_by_survey(self):
         out = {}

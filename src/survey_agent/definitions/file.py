@@ -17,6 +17,18 @@ time it is read (it gets the next version, as a snapshot) — the authored file 
 rewritten by `put_definition`, never by a read. Inspection-only callers (e.g. `survey-agent dsar`) set
 `snapshot_on_read = False`: versions are still computed, nothing is written.
 
+Live pointer: the editable file is the newest *authored* version, NOT what respondents get. The
+registry sidecar persists `live_version` — the version approved when the survey was marked live
+(`publish`, `launch`, `status --set live`, the gateway's gated registry write). Editing or `put`-ing the
+file never moves it, so a git-deploy that ships an edited file without an approved publish/launch keeps
+serving the previously approved snapshot. `get_registry` reports the newest version as
+`latest_version`; a survey that has never been marked live has no pin and reports its newest version as
+`live_version` too. (Registries written before the pointer existed — live but unpinned — are pinned on
+first read to the version they were serving.)
+
+Containment: ids must match `SURVEY_ID_RE` and every path is resolved and verified to sit inside the
+surveys directory before it is read, written or removed.
+
 Commit `.versions/` alongside the surveys if you deploy by git: it is the immutability trail that lets
 in-flight sessions finish on the version they started. The dot-directory is invisible to the survey
 catalog / registry / `*.survey.json` globs (they list the top level of SURVEY_DIR only).
@@ -29,7 +41,7 @@ import shutil
 import threading
 
 from survey_agent import registry
-from .base import DefinitionStore
+from .base import DefinitionStore, check_survey_id, marks_live, valid_survey_id
 from .mongo import _hash
 
 VERSIONS_DIR = ".versions"
@@ -42,10 +54,6 @@ def _as_version(v, default=1):
         return n if n >= 1 else default
     except (TypeError, ValueError):
         return default
-
-
-def _safe_id(survey_id):
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(survey_id)).strip(".") or "_"
 
 
 def _dump(path, spec):
@@ -70,17 +78,26 @@ class FileDefinitionStore(DefinitionStore):
         self._snap_hash = {}      # snapshot path -> content hash (snapshots are immutable)
         self._resolved = {}       # current-file path -> ((mtime_ns, size), version)
 
-    # ---- paths ----
+    # ---- paths (every one checked to stay inside self.dir) ----
+    def _inside(self, path):
+        """`path`, after verifying it resolves inside the surveys directory (symlinks resolved)."""
+        root = os.path.realpath(self.dir)
+        real = os.path.realpath(path)
+        if real == root or not real.startswith(root.rstrip(os.sep) + os.sep):
+            raise PermissionError(f"refusing a definition path outside {self.dir!r}: {path!r}")
+        return path
+
     def _file_for(self, survey_id):
         """Resolve id → path the same way the runtime did: catalog match, else <id>.survey.json."""
+        check_survey_id(survey_id)
         for e in registry.catalog(self.dir):
             if e.get("id") == survey_id and e.get("file"):
-                return os.path.join(self.dir, e["file"])
-        cand = os.path.join(self.dir, f"{survey_id}.survey.json")
+                return self._inside(os.path.join(self.dir, e["file"]))
+        cand = self._inside(os.path.join(self.dir, f"{survey_id}.survey.json"))
         return cand if os.path.isfile(cand) else None
 
     def _vdir(self, survey_id):
-        return os.path.join(self.dir, VERSIONS_DIR, _safe_id(survey_id))
+        return self._inside(os.path.join(self.dir, VERSIONS_DIR, check_survey_id(survey_id)))
 
     def _snap_path(self, survey_id, version):
         return os.path.join(self._vdir(survey_id), f"v{version}.survey.json")
@@ -173,8 +190,15 @@ class FileDefinitionStore(DefinitionStore):
 
     # ---- DefinitionStore ----
     def get_definition(self, survey_id, version=None):
+        """`version=None` → the approved live version (the registry pin), else the newest for a survey
+        that was never marked live."""
+        if not valid_survey_id(survey_id):
+            return None
         if version is None:
-            return self._current(survey_id)[0]
+            reg = self.get_registry(survey_id)
+            if reg is None:
+                return None
+            version = reg.get("live_version")
         version = _as_version(version, default=None)
         if version is None:
             return None
@@ -187,34 +211,61 @@ class FileDefinitionStore(DefinitionStore):
         return None
 
     def put_definition(self, spec):
-        s = spec.get("survey", {})
-        sid = s["id"]
+        """Write the editable current file (+ an immutable snapshot of a new version). Never moves the
+        registry's live pointer — that takes an approved mark-live."""
+        s = spec.get("survey", {}) if isinstance(spec, dict) else {}
+        sid = check_survey_id(s.get("id"))
         os.makedirs(self.dir, exist_ok=True)
         with self._lock:
+            path = self._file_for(sid) or self._inside(os.path.join(self.dir, f"{sid}.survey.json"))
             version, new = self._assign(sid, spec)
             if new:
                 self._snapshot(sid, version, spec)
-            path = self._file_for(sid) or os.path.join(self.dir, f"{sid}.survey.json")
             _dump(path, _pin(spec, version))        # the editable current file carries the assigned version
             self._resolved.pop(path, None)
         return version
 
+    def latest_version(self, survey_id):
+        """The newest authored version (the reconciled current file), or None."""
+        return self._current(survey_id)[1]
+
     def get_registry(self, survey_id):
+        if not valid_survey_id(survey_id):
+            return None
         entry = registry.load(self.dir)["surveys"].get(survey_id)
-        _, live_v = self._current(survey_id)
+        latest = self.latest_version(survey_id)
         if entry is None:
-            if live_v is None:
+            if latest is None:
                 return None
             entry = {}
-        return {**entry, "status": registry.derived_state(entry), "live_version": live_v or 1}
+        state = registry.derived_state(entry)
+        pinned = _as_version(entry.get("live_version"), default=None)
+        if pinned is None and state == "live" and latest is not None:
+            # A registry from before the live pointer existed: it was serving the current file, so pin
+            # exactly that — from now on only an approved mark-live moves it.
+            pinned = latest
+            if self.snapshot_on_read:
+                registry.record(survey_id, sdir=self.dir, live_version=latest)
+        return {**entry, "status": state,
+                "live_version": pinned if pinned is not None else (latest or 1),
+                "latest_version": latest}
 
     def set_registry(self, survey_id, **fields):
+        """Merge lifecycle fields. Callers gate mark-live (config.may_mark_live) first; a mark-live write
+        that names no `live_version` pins the newest authored version (snapshotting it)."""
+        check_survey_id(survey_id)
+        if marks_live(fields) and fields.get("live_version") is None:
+            latest = self.latest_version(survey_id)
+            if latest is not None:
+                fields["live_version"] = latest
         return registry.record(survey_id, sdir=self.dir, **fields)
 
     def list_surveys(self):
         return registry.catalog(self.dir)
 
     def iter_versions(self, survey_id):
+        if not valid_survey_id(survey_id):
+            return []
         _, cur_v = self._current(survey_id)          # make sure the current file has its snapshot
         out = []
         for v, path in sorted(self._snapshots(survey_id).items()):
@@ -229,6 +280,7 @@ class FileDefinitionStore(DefinitionStore):
         return out
 
     def delete_definition(self, survey_id):
+        check_survey_id(survey_id)
         with self._lock:
             path = self._file_for(survey_id)
             if path and os.path.exists(path):

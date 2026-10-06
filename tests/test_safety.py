@@ -234,3 +234,9 @@ def test_reviewers_pattern_cannot_hang_even_if_it_got_past_the_gate():
     except TimeoutError:
         pass
     assert time.perf_counter() - t < 0.5
+
+
+def test_without_the_regex_engine_patterns_are_refused_not_run_unbounded(monkeypatch):
+    from survey_agent.engine import safety
+    monkeypatch.setattr(safety, "_regex", None)
+    assert safety.safe_search(r"^\d{5}$", "12345") is None

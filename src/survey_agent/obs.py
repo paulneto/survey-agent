@@ -13,13 +13,18 @@ emits them as top-level fields, the text formatter appends them.
 Defence in depth, applied by both formatters to `extra=` fields:
   * `session_id` / `response_id` → a short stable hash (`redact_id`). A respondent session id is
     `survey:<rid>:<uid>`, i.e. it *encodes* the invite + respondent ids, so it is never logged raw.
-  * `url` → scheme://host/path only (`redact_url`): no query string (tokens, ids) and no userinfo.
+  * `url` → `scheme://host[:port]#<fingerprint>` (`redact_url`): the origin plus the first 8 hex of
+    sha256(full url) — never the path, query, fragment or userinfo. Webhook endpoints often carry their
+    credential as a *path* segment (`/hooks/<token>`), so the path is treated as secret too; the
+    fingerprint still lets an operator correlate log lines with a configured endpoint
+    (`obs.url_fingerprint(url)`).
 """
 import hashlib
 import json
 import logging
 import os
 import sys
+import re
 from urllib.parse import urlsplit
 
 _CONFIGURED = False
@@ -38,21 +43,35 @@ def redact_id(value):
     return "h:" + hashlib.sha256(str(value).encode()).hexdigest()[:12]
 
 
+def url_fingerprint(url):
+    """A short, stable, non-reversible handle for a full URL (first 8 hex of its sha256), so an
+    operator can tell which configured endpoint a log line is about without the line exposing it."""
+    return hashlib.sha256(str(url).encode()).hexdigest()[:8]
+
+
+_REDACTED_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://[^/?#@\s]+|<redacted>)#[0-9a-f]{8}$")
+
+
 def redact_url(url):
-    """scheme://host[:port]/path of `url` — drops userinfo, query string and fragment, which can
-    carry credentials, tokens, or respondent ids. Unparseable input becomes "<redacted>"."""
+    """`scheme://host[:port]#<fingerprint>` for `url` — the origin plus `url_fingerprint(url)`. The
+    path, query string, fragment and userinfo are all dropped: any of them can carry a credential
+    (webhook endpoints commonly embed a token as a path segment), a session token, or a respondent id.
+    Unparseable input becomes "<redacted>" (still fingerprinted when non-empty)."""
     if not url:
         return url
+    if _REDACTED_RE.match(str(url)):          # already redacted (call site + formatter): keep it stable
+        return str(url)
+    fp = url_fingerprint(url)
     try:
         p = urlsplit(str(url))
         host = p.hostname or ""
         if p.port:
             host = f"{host}:{p.port}"
         if not (p.scheme and host):
-            return "<redacted>"
-        return f"{p.scheme}://{host}{p.path}"
+            return f"<redacted>#{fp}"
+        return f"{p.scheme}://{host}#{fp}"
     except Exception:
-        return "<redacted>"
+        return f"<redacted>#{fp}"
 
 
 def _extras(record):
@@ -62,7 +81,7 @@ def _extras(record):
             continue
         if k in _ID_FIELDS:
             v = redact_id(v)
-        elif k in _URL_FIELDS:
+        elif k in _URL_FIELDS or k.endswith("_url"):
             v = redact_url(v)
         out[k] = v
     return out

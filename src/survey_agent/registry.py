@@ -92,9 +92,22 @@ def record_test(survey_id, cov, incidence=None, sdir=None):
     return record(survey_id, sdir=sdir, tested=tested)
 
 
-def set_status(survey_id, status=None, note=None, url=None, project=None, sdir=None):
+def _newest_version(survey_id, sdir):
+    """The newest authored version of a file-backed survey in `sdir` (snapshotted), or None."""
+    try:
+        from survey_agent.definitions.file import FileDefinitionStore
+        return FileDefinitionStore(surveys_dir(sdir)).latest_version(survey_id)
+    except Exception:
+        return None
+
+
+def set_status(survey_id, status=None, note=None, url=None, project=None, sdir=None, live_version=None):
     """Operator override: set an explicit lifecycle state, attach a note / live URL, and/or move the
-    survey to a project (a mutable organizational group; `""` clears it). `None` leaves a field as-is."""
+    survey to a project (a mutable organizational group; `""` clears it). `None` leaves a field as-is.
+
+    `status="live"` is the approved launch act (every caller gates it with `config.may_mark_live`
+    first), so it also pins the served version: `live_version` if given, else the newest authored
+    version of the survey file in `sdir`. Nothing else moves that pointer."""
     fields = {}
     if status is not None:
         fields["status"] = status
@@ -103,6 +116,10 @@ def set_status(survey_id, status=None, note=None, url=None, project=None, sdir=N
         if url is not None:
             live["url"] = url
         fields["live"] = live
+    if status == "live":
+        pin = live_version if live_version is not None else _newest_version(survey_id, sdir)
+        if pin is not None:
+            fields["live_version"] = pin
     if note is not None:
         fields["note"] = note
     if project is not None:

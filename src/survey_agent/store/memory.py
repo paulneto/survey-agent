@@ -13,6 +13,7 @@ class MemoryStore:
         self._by_key = {}       # (survey_id, rid, uid) -> session_id
         self._quotas = {}       # (survey_id, version) -> {quota_id: count}
         self._responses = []    # list of export records
+        self._reservations = {}  # (survey_id, version, key) -> bool (idempotent reserve_quotas)
 
     def get_or_create_session(self, survey_id, rid, uid, factory):
         key = (survey_id, str(rid), str(uid))
@@ -41,18 +42,34 @@ class MemoryStore:
             counts[quota_id] = counts.get(quota_id, 0) + 1
             return counts[quota_id]
 
-    def reserve_quotas(self, survey_id, version, limits):
-        """All-or-nothing: increment every bucket in `limits` iff each limited one is below its limit."""
+    def reserve_quotas(self, survey_id, version, limits, key=None):
+        """All-or-nothing: increment every bucket in `limits` iff each limited one is below its limit.
+        With `key` (the response id) a repeated call returns the first call's result unchanged."""
         with self._lock:
+            rkey = (survey_id, version, str(key)) if key is not None else None
+            if rkey is not None and rkey in self._reservations:
+                return self._reservations[rkey]
             counts = self._quotas.setdefault((survey_id, version), {})
-            if not check_reservation(counts, limits):
-                return False
-            for qid in (limits or {}):
-                counts[qid] = counts.get(qid, 0) + 1
-            return True
+            ok = check_reservation(counts, limits)
+            if ok:
+                for qid in (limits or {}):
+                    counts[qid] = counts.get(qid, 0) + 1
+            if rkey is not None:
+                self._reservations[rkey] = ok
+            return ok
 
     def record_response(self, survey_id, response):
+        """Upsert keyed by the response `id` (a re-recorded terminal replaces, never duplicates).
+        A record without an id is appended."""
+        if "survey_id" not in response:            # list_responses filters on it (as mongo stores it)
+            response = {"survey_id": survey_id, **response}
         with self._lock:
+            rid = response.get("id")
+            if rid is not None:
+                for i, r in enumerate(self._responses):
+                    if r.get("id") == rid:
+                        self._responses[i] = response
+                        return
             self._responses.append(response)
 
     def list_responses(self, survey_id=None, uid=None, id_fields=None):

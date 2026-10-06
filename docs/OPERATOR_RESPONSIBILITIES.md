@@ -24,8 +24,9 @@ runtime serves it — see [DEPLOY.md](DEPLOY.md).
   lists their responses and sessions, and `survey-agent dsar <id> --delete` erases those plus their
   uploaded files and queued webhook deliveries (every built-in store implements `find_respondent` /
   `erase_respondent`; a custom store must too). Copies outside the app — exports, backups, logs,
-  webhook/CRM/panel receivers, your warehouse — are yours to clear. Decide your retention policy
-  before you collect anything.
+  webhook/CRM/panel receivers, your warehouse — are yours to clear. If removing an uploaded file or
+  queued delivery fails, the command exits non-zero and keeps a job manifest; rerun `dsar --resume`
+  once the cause is fixed. Decide your retention policy before you collect anything.
 - **☐ Consent & disclosure.** The survey's consent/notice text must be accurate for your
   jurisdiction and audience. If you enable **LLM analysis** (`source: llm`, `SURVEY_LLM_ENRICH`) or
   **conversation mode**, respondent data is sent to the model provider you configured — disclose it.
@@ -34,14 +35,16 @@ runtime serves it — see [DEPLOY.md](DEPLOY.md).
 - **☐ URL integrity.** If any URL parameter affects **eligibility, quota, routing, or payment**,
   sign it: set `settings.url_signing.required` and mint per-respondent links with
   `survey-agent sign-url <survey> uid=… rid=…` (HMAC with the secret in `SURVEY_URL_SECRET`).
-  Unsigned parameters can be edited in the address bar.
+  Unsigned parameters can be edited in the address bar. Set the secret on the runtime as well: a
+  survey that requires signing refuses every invitation while `SURVEY_URL_SECRET` is unset.
 - **☐ Transport & access.** Serve the runtime over **HTTPS** (your host or proxy terminates TLS).
   The operator console (`survey-agent console`, or `/manage` with `SURVEY_CONSOLE=1`) is
   unauthenticated, and the API gateway (`survey-agent api`) runs **open unless you configure auth**
   (`SURVEY_API_TOKEN`, OAuth, or `sa_` API keys). Keep them off the public internet or behind your
   own auth.
 - **☐ Passback reliability.** Terminal passbacks (`redirect`, `webhook`, `panel` integrations) are
-  best-effort and carry an idempotency key. The optional durable outbox (`SURVEY_OUTBOX=1`) covers
+  best-effort and carry an idempotency key; a failure is logged, not shown to the respondent, and a
+  retried completion can repeat a passback with the same key, so dedupe on it. The optional durable outbox (`SURVEY_OUTBOX=1`) covers
   mid-survey webhook **actions** only. If a lost completion means an unpaid respondent, reconcile
   against the store (`/api/responses`, `export`) on your side.
 

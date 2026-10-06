@@ -204,7 +204,8 @@ def test_session_finishes_on_its_pinned_version_after_republish_and_restart():
             assert "Favourite colour?" in h
         # publish a materially different v2 (different pages/questions) and make it live
         assert defs.put_definition(_v2_spec()) == 2
-        registry.set_status("t_ver", status="live", sdir=d)
+        # saving a definition never moves the live pointer (N1): mark v2 live explicitly
+        registry.set_status("t_ver", status="live", live_version=2, sdir=d)
         with _serve_multi_dir(d, data) as (base, srv):                    # a fresh process
             _, h = _get(f"{base}/s/t_ver?uid=1&rid=1")                      # resume → still v1, page 2
             assert "Favourite colour?" in h and "brand-new" not in h
@@ -572,13 +573,13 @@ def test_survey_and_terminal_pages_carry_privacy_headers():
 
 def test_obs_redacts_urls_and_session_ids():
     from survey_agent import obs
-    assert obs.redact_url("https://user:pw@hooks.example:8443/a/b?token=abc&uid=1#f") == \
-        "https://hooks.example:8443/a/b"
+    full = "https://user:pw@hooks.example:8443/a/b?token=abc&uid=1#f"
+    assert obs.redact_url(full) == "https://hooks.example:8443#" + obs.url_fingerprint(full)
     rec = logging.makeLogRecord({"msg": "x", "session_id": "svy:rid-1:uid-2",
                                  "url": "https://h.example/p?secret=1"})
     ex = obs._extras(rec)
     assert "uid-2" not in str(ex["session_id"]) and ex["session_id"].startswith("h:")
-    assert ex["url"] == "https://h.example/p"
+    assert ex["url"] == "https://h.example#" + obs.url_fingerprint("https://h.example/p?secret=1")
     line = obs._JsonFormatter().format(rec)
     assert "uid-2" not in line and "secret" not in line
 
@@ -603,7 +604,7 @@ def test_webhook_failure_log_has_no_query_or_userinfo(caplog):
             pytest.skip("webhook action did not fire for this survey shape")
         formatted = " ".join(str(r.__dict__.get("url")) + str(server.obs._extras(r)) for r in recs)
         assert "SECRET" not in formatted and "pw" not in formatted
-        assert "127.0.0.1:9/hook" in formatted
+        assert "/hook" not in formatted and "http://127.0.0.1:9#" in formatted   # origin + fingerprint (N7)
 
 
 def test_passback_events_forward_only_declared_and_identity_vars():

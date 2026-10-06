@@ -32,7 +32,8 @@ That shapes the security boundary:
 Defense-in-depth still applies to operator input where it's cheap. In the reference warehouse
 adapter, SQL identifiers are validated and values are parameterized; regexes in validation and logic
 are length/complexity-bounded at validate time, their input is length-capped, and every match runs
-with a 50 ms timeout (the `regex` engine).
+with a 50 ms timeout (the `regex` engine). If `regex` is missing, survey patterns are refused rather
+than run without a time limit.
 
 ## Who it's for: two roles in one workflow
 
@@ -108,13 +109,21 @@ mean what operators expect: deployed and collecting.
   passback. With no token configured the gate can't be bypassed.
 - **Local sandboxes serve every state.** `survey-agent demo` (and local preview mode) use
   `SURVEY_SERVE_STATES=*`, which the CLI refuses to combine with public hosting.
-- **Marking live pins the version.** With the `mongo` definition source, respondents get the
-  `live_version` until a re-publish; edits create a new draft version that doesn't reach the field
-  until then. The `file` backend serves the current file as the live version and keeps every version
-  it has served or published as an immutable snapshot in `<SURVEY_DIR>/.versions/<id>/`, so in-flight
-  sessions still finish on the version they started.
+- **Saving is not approving.** Every definition backend keeps two numbers: `latest_version`, the
+  newest saved version, and `live_version`, the approved version respondents are served. Saving a
+  definition (the `file` backend's file, `put_definition`, the gateway's `PUT /v1/definitions`) only
+  adds a version. Only an approved mark-live moves `live_version`: `launch`, `publish`,
+  `status --set live`, the console's Mark live, or a gated gateway registry write. A mark-live that
+  names no version pins the newest saved one.
+- **The `file` backend works the same way.** Editing or bumping a `.survey.json` and deploying it
+  keeps serving the approved snapshot from `<SURVEY_DIR>/.versions/<id>/` until an approved launch or
+  publish pins the new version. So `surveys/.registry.json` and `surveys/.versions/` ship together:
+  a registry that pins a version whose snapshot isn't deployed makes that survey 404. A survey that
+  has never been marked live has no pin and reports its newest version as `live_version`. In-flight
+  sessions finish on the version they started.
 - **Unmanaged surveys are served.** A survey with no registry state (the single-file `serve` path) is
-  served as before; the gate applies once a lifecycle state exists. `SURVEY_SERVE_STATES` is also the
+  served as before; the gate applies once a lifecycle state exists. (With the `mongo` source, a stored
+  definition with no registry record reports `draft`, so it isn't served.) `SURVEY_SERVE_STATES` is also the
   lever for widening the gate temporarily during a migration.
 
 The gate lives in `server.py`, keyed off the definition-store registry; the engine stays pure.
@@ -190,7 +199,8 @@ crashing the simulator.
 
 ## Webhook actions are intents, delivered once
 
-A mid-survey `webhook` action fires at most once per session. The engine stays network-free: it
+A mid-survey `webhook` action is decided at most once per session (with several workers a delivery
+can repeat, always under the same idempotency key, so receivers should dedupe on it). The engine stays network-free: it
 returns a resolved intent with a stable `idempotency_key` (session + action index), and the caller
 delivers it. The optional durable outbox (`SURVEY_OUTBOX=1`, `survey-agent outbox`) covers these
 webhook actions; terminal passbacks go through the configured integration.

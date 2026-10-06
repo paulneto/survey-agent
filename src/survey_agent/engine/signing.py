@@ -15,26 +15,40 @@ see `server.py` for the reference wiring and `settings.url_signing` for the per-
     # -> {"uid": "u1", "rid": "r1", "group": "vip", "sig": "<hex>"}  ->  emit as the survey_url query
     ok = signing.verify(incoming_params, secret, ["uid","rid","group"])   # on ingest
 
-The signed payload is `field=value` for each `fields` entry (missing -> empty), sorted by field name
-and joined by "&" — stable regardless of query-string order, and independent of any unsigned params.
+Signature format (v2). The HMAC input is the domain-separation prefix `survey-agent/url-sig/v2\n`
+followed by the canonical JSON (compact separators, UTF-8, no ASCII escaping) of the ordered pair list
+`[[name, value], ...]` — one pair per declared field, sorted by field name, de-duplicated. A value is
+the field's string form; a field that is absent (or None) is encoded as JSON `null`, so a missing field
+never signs the same as an empty string. Because JSON quotes and escapes every string, no choice of
+values can shift a delimiter (the v1 `name=value&...` concatenation could: `rid="x&uid=y", uid="z"`
+signed the same bytes as `rid="x", uid="y&uid=z"`). The payload is stable regardless of query-string
+order and independent of any unsigned params. Any future change to the encoding must change the
+prefix, so old and new signatures can never be confused.
 """
 import hashlib
 import hmac
+import json
 
 DEFAULT_PARAM = "sig"
+FORMAT_PREFIX = b"survey-agent/url-sig/v2\n"
 
 
 def _canonical(params, fields):
-    """The exact bytes signed: each declared field as `name=value` (missing -> empty), name-sorted
-    and &-joined. Order-independent and blind to params outside `fields` (so adding tracking params
-    never invalidates a signature)."""
-    return "&".join(f"{f}={'' if params.get(f) is None else params[f]}" for f in sorted(fields))
+    """The exact bytes signed (excluding the version prefix): canonical JSON of the name-sorted
+    `[[name, value_or_null], ...]` pairs for the declared fields. Order-independent, unambiguous, and
+    blind to params outside `fields` (so adding tracking params never invalidates a signature)."""
+    pairs = []
+    for f in sorted({str(f) for f in fields}):
+        v = params.get(f)
+        pairs.append([f, None if v is None else str(v)])
+    return json.dumps(pairs, separators=(",", ":"), ensure_ascii=False)
 
 
 def signature(params, secret, fields):
     """The hex HMAC-SHA256 of the canonical payload. `secret` is a str or bytes shared secret."""
     key = secret.encode() if isinstance(secret, str) else secret
-    return hmac.new(key, _canonical(params, fields).encode(), hashlib.sha256).hexdigest()
+    msg = FORMAT_PREFIX + _canonical(params, fields).encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
 def sign_params(params, secret, fields, param=DEFAULT_PARAM):

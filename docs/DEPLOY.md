@@ -221,8 +221,10 @@ git push -u origin survey/ai-at-work
 gh pr create --fill          # a teammate reviews → merges to main
 ```
 
-`surveys/.versions/` appears once the survey has been published (`survey-agent publish`) or served
-locally (Step 4); skip that line if it isn't there yet. `./deploy.sh "msg"` stages all three for you
+`surveys/.versions/` appears once the survey has been launched, published (`survey-agent publish`)
+or served locally (Step 4); skip that line if it isn't there yet. Always ship `.registry.json` and
+`.versions/` together: the registry pins the approved version, and a pin whose snapshot isn't deployed
+makes that survey 404. `./deploy.sh "msg"` stages all three for you
 and refuses to commit anything outside `surveys/`, `templates/` and `triggers/` (override the list
 with `DEPLOY_PATHS`).
 
@@ -247,6 +249,8 @@ survey-agent sign-url surveys/ai-at-work.survey.json uid=123 rid=456 group=newsl
 ```
 
 …and set `settings.url_signing.required` in the survey so the runtime rejects unsigned or edited links.
+The runtime needs `SURVEY_URL_SECRET` too: while it is unset or blank, a survey that requires signed
+links refuses every invitation (403) rather than accepting unsigned ones.
 Adding *another* survey later is just another file + push — no new service.
 
 > **Without the redeploy — a runtime definition store.** The above is the default (`file`) model:
@@ -256,7 +260,9 @@ Adding *another* survey later is just another file + push — no new service.
 > ```bash
 > survey-agent publish surveys/ai-at-work.survey.json   # validate → store → live, NO redeploy
 > ```
-> `publish` is subject to the same approval gate. The survey is live immediately and version-pinned
+> `publish` is subject to the same approval gate. Saving a definition to the store without an approved
+> mark-live (a plain `PUT /v1/definitions`, or `publish` refused by the gate) never changes what is
+> served. The survey is live immediately and version-pinned
 > (in-flight respondents keep their version); commit the file too as the readable backup. Pause/close
 > the same way with no redeploy (`survey-agent status ai-at-work --set paused`), and use
 > `defs-export --all` / `defs-import` / `defs-diff` for cold backup, store-loss rebuild, and file↔store
@@ -375,16 +381,24 @@ Change wording, add a question, tighten a quota — same loop:
 ```bash
 /edit-survey surveys/ai-at-work.survey.json …      # or /add-logic …
 survey-agent validate surveys/ai-at-work.survey.json && survey-agent simulate surveys/ai-at-work.survey.json --n 500
-git commit -am "ai-at-work: add follow-up on budget" && git push    # PR → merge → redeploy
+survey-agent launch surveys/ai-at-work.survey.json --base https://my-surveys.onrender.com   # approve the new version
+./deploy.sh "ai-at-work: add follow-up on budget"                   # commits the file, .versions/ and .registry.json, pushes → redeploy
 ```
 Definitions are **immutable + versioned**: respondents already mid-survey stay on the version they
-started; new respondents get the new one.
+started; new respondents get the new one once it is approved.
+
+- **Saving is not approving.** Editing or bumping the file only adds a version. The runtime keeps
+  serving the version that was approved when the survey was marked live (`live_version` in
+  `surveys/.registry.json`) until an approved `launch`, `publish` or `status --set live` pins the new
+  one. So a push of the edited file alone changes nothing for respondents. The registry record (for
+  example the gateway's `GET /v1/registry/<id>`) reports both `live_version` and `latest_version`.
 
 - **Where versions live (file definitions).** Each version is kept as a read-only snapshot at
-  `surveys/.versions/<id>/v<N>.survey.json`. `survey-agent publish` writes it, and so does the
-  runtime the first time it serves a new version. Commit `surveys/.versions/` with the survey so the
-  redeployed runtime still has the version in-progress respondents started on (`./deploy.sh` stages
-  it, and the Docker build context includes it). A database definition source (`mongo`) keeps every
+  `surveys/.versions/<id>/v<N>.survey.json`. `survey-agent launch` and `publish` write it, and so
+  does the runtime the first time it reads a new version. Commit `surveys/.versions/` with the survey
+  and `surveys/.registry.json` so the redeployed runtime has both the approved version and the
+  versions in-progress respondents started on (`./deploy.sh` stages them, and the Docker build
+  context includes them). A database definition source (`mongo`) keeps every
   version in the store.
 - **Version numbers follow the content.** The same content keeps its version. Changed content never
   reuses a number: if you edit without bumping `version` (or reuse an old number), it gets the next
@@ -460,14 +474,15 @@ survey-agent status ai-at-work --set live --url https://my-surveys.onrender.com/
 > (`draft`/`validated`/`tested`/`approved`) show a **"not open yet"** page — operators preview them on a
 > hosted runtime with `SURVEY_PREVIEW_TOKEN` (`/s/<id>?preview=<token>`; preview collects no data), or
 > locally with `serve --preview`. **`paused`/`closed`** show their pages and start **no new sessions**
-> (in-flight respondents may finish). Marking live pins the launched version. So:
+> (in-flight respondents may finish). Marking live pins the launched version, and `--set live` pins
+> the newest saved version (so resuming after an edit also approves the edit). So:
 > ```bash
 > survey-agent status ai-at-work --set paused    # stop fielding (respondents see a "paused" page)
 > survey-agent status ai-at-work --set live      # resume
 > survey-agent status ai-at-work --set closed    # stop fielding for good ("closed" page)
 > ```
-> With file-based definitions, commit the `surveys/.registry.json` change and deploy for it to take
-> effect on the hosted runtime. To remove a survey entirely, delete its file and redeploy.
+> With file-based definitions, commit the `surveys/.registry.json` change (and `surveys/.versions/`)
+> and deploy for it to take effect on the hosted runtime. To remove a survey entirely, delete its file and redeploy.
 
 ---
 
@@ -659,9 +674,10 @@ for the full flags of any command.
 | `survey-agent report <survey> [--insights] [--open]` | HTML report — completes, incidence, median LOI, screen-out/quota counts, cross-tabs. |
 | `survey-agent insights <survey>` | AI analyst read-out: headline, findings, open-text themes, next steps. |
 | `survey-agent export <survey> [--format csv\|parquet] [--out …]` | Raw responses for your own BI tooling (not redacted). |
-| `survey-agent backup [--survey ID] [--out F]` / `restore <file>` | Portable JSONL backup of stored responses / reload into any store. |
+| `survey-agent backup [--survey ID] [--out F]` / `restore <file>` | Portable JSONL backup of stored responses / reload into any store (safe to re-run: a response id already stored is not duplicated). |
 | `survey-agent defs-export [--all]` / `defs-import` / `defs-diff` | Back up, rebuild, and reconcile a runtime definition store. |
-| `survey-agent dsar <id> [--survey ID] [--id-field VAR] [--delete] [--yes] [--json [--full]]` | Find a subject's responses and sessions (`--json --full` = the access copy); `--delete` erases them plus their uploads and queued webhook deliveries. |
+| `survey-agent dsar <id> [--survey ID] [--id-field VAR] [--delete] [--yes] [--json [--full]]` | Find a subject's responses and sessions (`--json --full` = the access copy); `--delete` erases them plus their uploads and queued webhook deliveries, tracked in a resumable job manifest. |
+| `survey-agent dsar --resume` | Retry unfinished erasure jobs only (every `dsar` run also retries them first); exits non-zero while any is incomplete. |
 | `survey-agent outbox status\|list\|retry [--dead]` | Inspect/retry the durable outbox for webhook actions (`SURVEY_OUTBOX=1`). |
 | `survey-agent docs [name] [--open]` | List or open the bundled docs. |
 | `survey-agent help` | Guided overview of the commands + the author→launch→report flow. |
@@ -686,6 +702,7 @@ for the full flags of any command.
 | `SURVEY_STORE` | `file` (default when unset) \| `sqlite` \| `mongo` \| `http` \| `memory` \| `pkg.module:Store`. |
 | `SURVEY_DEFINITION_SOURCE` | Where definitions + lifecycle live: `file` (default) \| `mongo` \| `http` \| `pkg.module:Defs`. Non-file = publish/pause are store writes, no redeploy. |
 | `SURVEY_DATA_DIR` | File-store directory (default `./survey_data`). |
+| `SURVEY_ERASURE_DIR` | Where `dsar --delete` keeps its erasure job manifests (default `<SURVEY_DATA_DIR>/erasure/`). |
 | `SURVEY_SQLITE_PATH` | SQLite file for `SURVEY_STORE=sqlite`. |
 | `SURVEY_OUTPUT_DIR` | Folder for generated reports / dashboards / exports (also `output.dir` in `survey-agent.config.yaml`). An explicit `--out` wins. |
 | `SURVEY_MONGODB_URI` / `SURVEY_MONGODB_DB` | Mongo connection + database name. |
@@ -700,7 +717,7 @@ for the full flags of any command.
 | `SURVEY_CHAT_DEMO` | `1` = serve the `/chat` preview outside demo/preview mode (it records nothing). |
 | `SURVEY_PUBLIC_BASE_URL` | Optional override for the public base in emitted URLs (otherwise derived from the host; `doctor` shows it). |
 | `SURVEY_LAUNCH_APPROVAL_TOKEN` | When set, marking live on any surface requires this token. |
-| `SURVEY_URL_SECRET` | HMAC secret for signed respondent URLs (`sign-url` + runtime verification). |
+| `SURVEY_URL_SECRET` | HMAC secret for signed respondent URLs (`sign-url` + runtime verification). A survey that requires signing refuses every invitation while it is unset. |
 | `SURVEY_INTEGRATION` | Terminal passback: `none` (default) \| `redirect` \| `webhook` \| `panel` \| `mailchimp` \| plugin. |
 | `SURVEY_WEBHOOK_SECRET` | HMAC secret signing outbound webhook posts. |
 | `SURVEY_REDIRECT_{COMPLETE,TERMINATED,OVERQUOTA}_URL` | When `=redirect`: per-status URL the browser is sent to at a terminal. |
@@ -778,7 +795,7 @@ Set inside the survey JSON under `settings` (the authoring/`/edit-survey` skills
 |---|---|
 | `retake` | `"once"` (default) — a finished invite link (uid+rid) is locked and shows an already-completed screen. `"multiple"` — returning after finishing starts a **fresh attempt**; each completion is kept as its own response with its own id and passback. |
 | `identity` | Which URL vars carry identity — `{respondent, response}`; defaults to `uid`/`rid`. |
-| `url_signing.required` | Reject links whose signed params are missing or edited (see `sign-url`). |
+| `url_signing.required` | Reject links whose signed params are missing or edited (see `sign-url`). Without `SURVEY_URL_SECRET` every invitation is refused. |
 | `theme` | Visual theme for the survey pages (`dark`, `ocean`, `paper`, or your own via `SURVEY_THEMES_DIR`). |
 | `anti_fraud` | Declared and reference-checked, but **not enforced by the engine** yet — write an attention check as an ordinary disqualify rule. |
 

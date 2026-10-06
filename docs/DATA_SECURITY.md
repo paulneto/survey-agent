@@ -81,7 +81,11 @@ Notes:
   Captured is not verified: **the moment a parameter affects screen-out, quota, routing, or payment,
   sign it.** Mint a per-respondent link with `survey-agent sign-url <survey> uid=… rid=… [group=…]`
   (or `survey_agent.engine.signing` in code) and set `settings.url_signing.required` so the runtime
-  checks the signature. The secret lives in `SURVEY_URL_SECRET`, never in the survey JSON.
+  checks the signature. The secret lives in `SURVEY_URL_SECRET`, never in the survey JSON. Signing
+  fails closed: while the secret is unset or blank, a survey that requires signed links refuses
+  every invitation (403), and the runtime warns about those surveys at startup.
+  `sign-url` refuses a blank value for a signed field (an empty value arrives as missing and could
+  never verify).
 - Respondents have **no login**; identity is the (ideally signed) `uid`/`rid`.
 
 ### Behavioral enrichment (high-sensitivity path)
@@ -109,7 +113,8 @@ A `webhook` action sends data **out** mid-survey. Treat its payload as a deliber
 - **Signed.** With `SURVEY_WEBHOOK_SECRET` set, outbound webhook POSTs carry
   `X-Survey-Signature: t=<ts>,v1=<HMAC-SHA256 of "{ts}.{body}">`. Receivers verify with
   `integrations.webhook.verify(secret, body, header)`, which also rejects stale timestamps (default 300s).
-- **Fire-once, fail-open.** A webhook action fires at most once per session and never blocks the
+- **Once per session, fail-open.** The engine decides a webhook action at most once per session (with
+  several workers, a delivery can repeat, always under the same idempotency key) and never blocks the
   respondent. For retries, enable the durable outbox (`SURVEY_OUTBOX=1`, inspect with
   `survey-agent outbox`); it covers webhook **actions** only, not terminal passbacks.
 - Terminal passbacks go out only through the integration you select; with `SURVEY_INTEGRATION`
@@ -138,6 +143,13 @@ The `video` type is display-only and stores no respondent data, but it embeds th
   implements `find_respondent` / `erase_respondent`; a custom store must too. **Still yours:** copies
   delivered outside the app — passbacks already sent to webhooks/panels/CRMs, backups, exports, log
   files and downstream warehouses. The command says so when it finishes.
+- **Erasure is resumable.** Before `dsar --delete` deletes any record, it writes a job manifest to
+  `$SURVEY_ERASURE_DIR` (default `<SURVEY_DATA_DIR>/erasure/`, mode 0600) listing the uploaded files
+  and queued webhook deliveries still to remove. It holds a hash of the subject id, never the raw id
+  or any answers, and is deleted once everything is gone. If a removal fails, the command exits
+  non-zero and keeps the manifest; every later `dsar` run retries unfinished jobs first, and
+  `survey-agent dsar --resume` retries them without looking anyone up. Nothing is written when there
+  are no files or queued deliveries to remove.
 - **Retention:** survey-agent does not expire responses or sessions. Define a retention policy and
   enforce it (e.g. a scheduled `dsar --delete`, or store-level TTLs).
 
@@ -156,7 +168,13 @@ The `video` type is display-only and stores no respondent data, but it embeds th
 
 ### Integrity & delivery
 - Terminal passbacks carry an **idempotency key** (the response id) so receiver retries are safe.
-  They are best-effort; reconcile against the store if a lost passback matters (e.g. payment).
+  They run after the response is recorded and are best-effort: a failure is logged, not shown to the
+  respondent. A passback can fire more than once (a completion retried after a failure, or two
+  workers), always with the same key, so dedupe on it. Reconcile against the store if a lost
+  passback matters (e.g. payment).
+- **Completions are recorded once.** Quota reservation is keyed by the response id and responses are
+  upserted by id, so a retried completion takes one quota slot and leaves one record. A completion
+  interrupted part-way (a storage error, a crash) is finished on the respondent's next request.
 - **Anti-fraud settings** (`settings.anti_fraud`: attention checks, duplicate-uid blocking, …) are
   declared in the schema and checked for references, but are **not enforced by the engine** yet.
   Today, implement an attention check as an ordinary disqualify rule. `settings.retake` (`once` by
@@ -165,8 +183,10 @@ The `video` type is display-only and stores no respondent data, but it embeds th
 ### Observability (without leaking)
 - The runtime logs via the `survey_agent` logger (`SURVEY_LOG_LEVEL`, `SURVEY_LOG_FORMAT=json`) and
   logs identifiers and statuses, not answers. Session and response ids are logged as a short stable
-  hash (a session id encodes the invite and respondent ids), and URLs are reduced to scheme, host and
-  path, with no query string. Keep any custom code to the same rule: **never log answers, free text,
+  hash (a session id encodes the invite and respondent ids). URLs (a `url` field, or any field ending
+  in `_url`) are reduced to `scheme://host[:port]#<fingerprint>` (the first 8 hex characters of the
+  full URL's SHA-256), never the path, query or userinfo: webhook URLs often carry their secret in
+  the path. Keep any custom code to the same rule: **never log answers, free text,
   enrichment values, or full `url_variables`.**
 - **Audit logging** of authoring actions, exports and erasures is **not provided** beyond the
   per-response `llm_audit`. If you need it, record it at your gateway, proxy, or CI.

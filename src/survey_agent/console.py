@@ -234,10 +234,10 @@ def set_status(survey_id, status, approve=None):
             raise LaunchGated(f"not marked live: {why}.")
     fields = {"status": status}
     if status == "live":
+        # No explicit live_version: an approved mark-live pins the newest saved version (the store does
+        # it), the same as the CLI and the gateway. get_definition(id) would return the CURRENT pin,
+        # which would silently keep serving the old version after an edit.
         fields["live"] = {"at": registry.now()}
-        spec = _defstore().get_definition(survey_id)        # pin the launched version (respondents stay on it
-        if spec:                                            # until a re-publish; backends that can't pin ignore it)
-            fields["live_version"] = spec.get("survey", {}).get("version", 1)
     _defstore().set_registry(survey_id, **fields)
     return survey_detail(survey_id)
 

@@ -7,10 +7,14 @@ is imported lazily so the rest of the package works without it installed.
 Collections:
   sessions        unique index (survey_id, rid, uid); also index session_id, url_variables.uid
   quota_counters  unique index (survey_id, version, quota_id); $inc is atomic
-  responses       append-only export records; index (survey_id, url_variables.uid)
+  quota_reservations  one doc per reserve_quotas(key=...) outcome (`_id` = [survey, version, key])
+  responses       export records, `_id` = the response id (upsert — one record per response);
+                  index (survey_id, url_variables.uid)
 
 `client=` injects an already-built client (e.g. mongomock in tests) instead of connecting to `uri`.
 """
+import json
+
 from . import (erasure_result, norm_id_fields, response_matches,
                session_matches)
 
@@ -32,6 +36,7 @@ class MongoStore:
         self.sessions = self.db.sessions
         self.quota_counters = self.db.quota_counters
         self.responses = self.db.responses
+        self.quota_reservations = self.db.quota_reservations
         # idempotency + lookup indexes
         self.sessions.create_index([("survey_id", ASCENDING), ("rid", ASCENDING), ("uid", ASCENDING)], unique=True)
         self.sessions.create_index("session_id", unique=True)
@@ -81,7 +86,32 @@ class MongoStore:
         return (doc or {}).get("count", 1)
 
     # ---- all-or-nothing quota reservation ----
-    def reserve_quotas(self, survey_id, version, limits):
+    @staticmethod
+    def _reservation_id(survey_id, version, key):
+        return json.dumps([survey_id, version, str(key)])
+
+    def _existing_reservation(self, rid, session=None):
+        doc = self.quota_reservations.find_one({"_id": rid}, session=session) if session is not None \
+            else self.quota_reservations.find_one({"_id": rid})
+        return None if doc is None else bool(doc.get("ok"))
+
+    def _record_reservation(self, rid, ok, session=None):
+        """Insert the outcome for `rid`. Returns None when this call recorded it, else the outcome
+        another worker recorded first (DuplicateKeyError on the `_id`)."""
+        from pymongo.errors import DuplicateKeyError
+        try:
+            if session is not None:
+                self.quota_reservations.insert_one({"_id": rid, "ok": bool(ok)}, session=session)
+            else:
+                self.quota_reservations.insert_one({"_id": rid, "ok": bool(ok)})
+            return None
+        except DuplicateKeyError:
+            if session is not None:
+                raise
+            got = self._existing_reservation(rid)
+            return bool(ok) if got is None else got
+
+    def reserve_quotas(self, survey_id, version, limits, key=None):
         """Increment every bucket in `limits` iff each limited one is below its limit; all-or-nothing.
 
         With a replica set / mongos, one multi-document transaction does the conditional increments
@@ -89,22 +119,40 @@ class MongoStore:
         standalone server (no transactions) it falls back to sequential conditional `$inc`s
         (`count < limit` in the filter) and compensates (`$inc: -1`) any already taken when a later
         one fails — never over-fills; in the brief compensation window a concurrent reserver may
-        see an inflated count and be refused (a safe false "full")."""
-        if not limits:
+        see an inflated count and be refused (a safe false "full").
+
+        `key` (the response id) makes the call idempotent across workers: the outcome is stored in
+        `quota_reservations` (inside the transaction when there is one) and a repeated call returns it
+        without incrementing again. Without transactions, the increments happen first and the outcome
+        doc is inserted after; a racing worker that loses the insert compensates its own increments
+        and returns the winner's outcome (a crash between the two steps can leak one slot — the safe
+        direction: it can refuse, never over-fill)."""
+        if not limits and key is None:
             return True
-        self._ensure_counters(survey_id, version, list(limits))
+        rid = None if key is None else self._reservation_id(survey_id, version, key)
+        if rid is not None:
+            got = self._existing_reservation(rid)
+            if got is not None:
+                return got
+        self._ensure_counters(survey_id, version, list(limits or {}))
         if self._txn_ok is not False:
             try:
-                return self._reserve_txn(survey_id, version, limits)
+                return self._reserve_txn(survey_id, version, limits or {}, rid)
             except NotImplementedError:                    # e.g. mongomock: no sessions
                 self._txn_ok = False
             except Exception as e:                         # standalone mongod: IllegalOperation (20)
+                from pymongo.errors import DuplicateKeyError
+                if isinstance(e, DuplicateKeyError) and rid is not None:
+                    got = self._existing_reservation(rid)  # another worker recorded it first
+                    if got is not None:
+                        return got
+                    raise
                 if getattr(e, "code", None) == 20 or "Transaction numbers" in str(e) \
                         or "replica set" in str(e):
                     self._txn_ok = False
                 else:
                     raise
-        return self._reserve_sequential(survey_id, version, limits)
+        return self._reserve_sequential(survey_id, version, limits or {}, rid)
 
     def _ensure_counters(self, survey_id, version, qids):
         """Create missing counters at 0 (outside any transaction), so the conditional increments never
@@ -128,7 +176,7 @@ class MongoStore:
         res = self.quota_counters.update_one(filt, {"$inc": {"count": 1}}, session=session)
         return res.modified_count == 1
 
-    def _reserve_txn(self, survey_id, version, limits):
+    def _reserve_txn(self, survey_id, version, limits, rid=None):
         outcome = {}
 
         def body(session):
@@ -137,28 +185,57 @@ class MongoStore:
                 if not self._cond_inc(survey_id, version, qid, lim, session=session):
                     session.abort_transaction()
                     return
+            if rid is not None:
+                self._record_reservation(rid, True, session=session)
             outcome["ok"] = True
 
         with self._client.start_session() as session:
             session.with_transaction(body)
         self._txn_ok = True
+        if not outcome["ok"] and rid is not None:          # record the refusal (outside the aborted txn)
+            got = self._record_reservation(rid, False)
+            if got is not None:
+                return got
         return outcome["ok"]
 
-    def _reserve_sequential(self, survey_id, version, limits):
+    def _compensate(self, survey_id, version, qids):
+        for t in qids:
+            self.quota_counters.update_one(
+                {"survey_id": survey_id, "version": version, "quota_id": t}, {"$inc": {"count": -1}})
+
+    def _reserve_sequential(self, survey_id, version, limits, rid=None):
         taken = []
+        ok = True
         for qid, lim in limits.items():
             if self._cond_inc(survey_id, version, qid, lim):
                 taken.append(qid)
                 continue
-            for t in taken:                                # compensate: no partial reservation
-                self.quota_counters.update_one(
-                    {"survey_id": survey_id, "version": version, "quota_id": t}, {"$inc": {"count": -1}})
-            return False
-        return True
+            self._compensate(survey_id, version, taken)    # compensate: no partial reservation
+            taken, ok = [], False
+            break
+        if rid is not None:
+            got = self._record_reservation(rid, ok)
+            if got is not None:                            # another worker's outcome stands
+                self._compensate(survey_id, version, taken)
+                return got
+        return ok
 
     # ---- responses ----
     def record_response(self, survey_id, response):
-        self.responses.insert_one({"survey_id": survey_id, **response})
+        """Upsert keyed by the response `id` (stored as `_id`, so the server enforces uniqueness): a
+        re-recorded terminal — retried after a failure, or processed by two hosts — replaces its
+        document, never adds a second one. A record without an id is inserted."""
+        from pymongo.errors import DuplicateKeyError
+        doc = {"survey_id": survey_id, **response}
+        rid = response.get("id")
+        if rid is None:
+            self.responses.insert_one(doc)
+            return
+        doc["_id"] = str(rid)
+        try:
+            self.responses.replace_one({"_id": doc["_id"]}, doc, upsert=True)
+        except DuplicateKeyError:                          # two concurrent upserts: the retry replaces
+            self.responses.replace_one({"_id": doc["_id"]}, doc, upsert=True)
 
     @staticmethod
     def _id_query(prefix, respondent_id, fields):

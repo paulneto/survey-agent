@@ -28,7 +28,7 @@
     survey-agent templates · new <tpl> --slug S     list templates · scaffold a survey from one
     survey-agent copy <id|file> --slug S · templatize <id|file>   duplicate a survey · promote it to a template
     survey-agent backup · restore <file>            response backup to JSONL · idempotent reload
-    survey-agent dsar <uid> [--delete]              find / erase one subject's data
+    survey-agent dsar <uid> [--delete] · dsar --resume   find / erase one subject's data · finish pending erasures
     survey-agent outbox status|list|retry           the durable webhook outbox
     survey-agent api [--host H] [--port P]          the authenticated API gateway ([api] extra)
     survey-agent docs [name] · selftest              documentation map · prove the install works
@@ -604,6 +604,12 @@ def _cmd_sign_url(a):
         print(f"❌ missing signed field(s): {', '.join(missing)} — sign-url needs every field in "
               f"url_signing.fields ({', '.join(fields)}).")
         return 1
+    blank = [f for f in fields if params.get(f) == ""]
+    if blank:
+        # the runtime parses the query without blank values, so a signed `f=` arrives as *missing* and
+        # (missing != empty in the signature) could never verify — refuse rather than mint a dead URL
+        print(f"❌ signed field(s) with an empty value: {', '.join(blank)} — give each a value.")
+        return 1
     from survey_agent import hosting
     base = hosting.public_base_url(a.base)
     query = signing.signed_query(params, secret, fields)
@@ -1026,6 +1032,10 @@ def _cmd_status(a):
     if not entry:
         print(f"no survey '{a.survey_id}' (try: survey-agent list)")
         return 1
+    reg = (store.get_registry(a.survey_id) or {}) if hasattr(store, "get_registry") else {}
+    for k in ("live_version", "latest_version"):        # what's served vs. what's saved
+        if reg.get(k) is not None:
+            entry[k] = reg[k]
     print(json.dumps(entry, indent=2))
     return 0
 
@@ -1636,6 +1646,186 @@ _DSAR_OUTSIDE = ("Copies already delivered outside this app are NOT erased by th
                  "subject there too.")
 
 
+# ---- durable erasure jobs (DSAR) -------------------------------------------------------------
+# Erasing a subject spans three seams: the session/response store, the upload (blob) store and the
+# webhook outbox. The store returns the blob refs / outbox keys only from the records it deletes, so a
+# failed or interrupted blob/outbox removal would otherwise lose the only pointer to that data. Before
+# any source record is deleted we therefore persist an *erasure manifest* listing what is still to be
+# removed — upload refs and outbox idempotency keys, a hash of the subject id, timestamps; never
+# answers — and tick items off as they succeed. The manifest is deleted only when everything is gone.
+# Every `dsar` invocation (and `dsar --resume`) first retries any manifest left behind.
+
+_ERASURE_VERSION = 1
+
+
+def _erasure_dir():
+    return os.path.abspath(os.environ.get("SURVEY_ERASURE_DIR")
+                           or os.path.join(os.environ.get("SURVEY_DATA_DIR", "./survey_data"), "erasure"))
+
+
+def _subject_hash(uid):
+    import hashlib
+    return hashlib.sha256(b"survey-agent/dsar-subject\n" + str(uid).encode("utf-8")).hexdigest()
+
+
+def _utcnow():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _erasure_save(m):
+    """Atomically (re)write a manifest, 0600 in a 0700 directory."""
+    d = _erasure_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    m["updated_at"] = _utcnow()
+    path = os.path.join(d, f"{m['job_id']}.json")
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(m, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path
+
+
+def _erasure_remove(m):
+    try:
+        os.remove(os.path.join(_erasure_dir(), f"{m['job_id']}.json"))
+    except FileNotFoundError:
+        pass
+
+
+def _erasure_pending():
+    """Every manifest left on disk (oldest first). Never creates the directory. An unreadable manifest
+    is reported as an error entry, not silently skipped."""
+    d = _erasure_dir()
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for name in sorted(os.listdir(d)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, name)) as f:
+                m = json.load(f)
+            if not isinstance(m, dict) or not m.get("job_id"):
+                raise ValueError("not an erasure manifest")
+            out.append(m)
+        except Exception as e:  # noqa: BLE001
+            out.append({"job_id": name[:-5], "corrupt": f"{e}"})
+    return sorted(out, key=lambda m: (m.get("created_at") or "", m["job_id"]))
+
+
+def _ref_id(ref):
+    return (ref.get("backend"), ref.get("bucket"), ref.get("key"))
+
+
+def _erasure_add(m, refs=(), keys=()):
+    have = {_ref_id(r) for r in m["pending"]["upload_refs"]}
+    for r in refs or ():
+        if isinstance(r, dict) and _ref_id(r) not in have:
+            have.add(_ref_id(r))
+            m["pending"]["upload_refs"].append(r)
+    for k in keys or ():
+        if k and k not in m["pending"]["webhook_keys"]:
+            m["pending"]["webhook_keys"].append(k)
+
+
+def _erasure_new(uid, survey_id):
+    import secrets
+    now = _utcnow()
+    return {"version": _ERASURE_VERSION,
+            "job_id": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(6),
+            "subject_sha256": _subject_hash(uid), "survey_id": survey_id,
+            "state": "erasing_records", "created_at": now, "updated_at": now,
+            "pending": {"upload_refs": [], "webhook_keys": []},
+            "done": {"uploads_deleted": 0, "outbox_cleared": 0}, "errors": []}
+
+
+def _erasure_has_pending(m):
+    return bool(m["pending"]["upload_refs"] or m["pending"]["webhook_keys"])
+
+
+def _erasure_run(m):
+    """Remove every pending blob and outbox item in `m`, persisting progress after each success. When
+    nothing is left (and the records are known erased) the manifest is deleted. Returns a report dict;
+    `complete` is False when anything is still pending."""
+    errors = []
+    for ref in list(m["pending"]["upload_refs"]):
+        _, errs = _dsar_delete_uploads([ref])
+        if errs:
+            errors.extend(errs)
+            continue
+        m["pending"]["upload_refs"].remove(ref)
+        m["done"]["uploads_deleted"] += 1
+        _erasure_save(m)
+    if m["pending"]["webhook_keys"]:
+        try:
+            m["done"]["outbox_cleared"] += _dsar_clear_outbox(m["pending"]["webhook_keys"])
+            m["pending"]["webhook_keys"] = []
+            _erasure_save(m)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"outbox: {e}")
+    warn = None
+    if m.get("state") != "records_erased":
+        warn = ("this job was interrupted before the store confirmed the records were erased — re-run "
+                "`survey-agent dsar <uid> --delete` for the subject to make sure they are gone")
+    m["errors"] = errors
+    complete = not _erasure_has_pending(m)
+    if complete:
+        _erasure_remove(m)
+    else:
+        _erasure_save(m)
+    return {"job_id": m["job_id"], "created_at": m.get("created_at"), "state": m.get("state"),
+            "complete": complete, "uploads_deleted": m["done"]["uploads_deleted"],
+            "outbox_cleared": m["done"]["outbox_cleared"],
+            "uploads_pending": len(m["pending"]["upload_refs"]),
+            "outbox_keys_pending": len(m["pending"]["webhook_keys"]),
+            "errors": errors, "warning": warn}
+
+
+def _erasure_resume_all():
+    """Retry every pending manifest. Returns a list of per-job reports (corrupt manifests included,
+    reported as not complete)."""
+    out = []
+    for m in _erasure_pending():
+        if m.get("corrupt"):
+            out.append({"job_id": m["job_id"], "complete": False,
+                        "errors": [f"unreadable erasure manifest: {m['corrupt']} — inspect "
+                                   f"{os.path.join(_erasure_dir(), m['job_id'] + '.json')}"]})
+            continue
+        m.setdefault("pending", {}).setdefault("upload_refs", [])
+        m["pending"].setdefault("webhook_keys", [])
+        m.setdefault("done", {}).setdefault("uploads_deleted", 0)
+        m["done"].setdefault("outbox_cleared", 0)
+        out.append(_erasure_run(m))
+    return out
+
+
+def _print_resumed(resumed):
+    for r in resumed:
+        if r.get("complete"):
+            print(f"✅ finished pending erasure job {r['job_id']} ({r.get('uploads_deleted', 0)} uploaded "
+                  f"file(s), {r.get('outbox_cleared', 0)} queued webhook delivery(ies) removed)")
+        else:
+            print(f"❌ erasure job {r['job_id']} still incomplete: {r.get('uploads_pending', '?')} "
+                  f"upload(s), {r.get('outbox_keys_pending', '?')} outbox key(s) pending — "
+                  f"retry with `survey-agent dsar --resume`", file=sys.stderr)
+            for e in r.get("errors") or []:
+                print(f"   ❌ {e}", file=sys.stderr)
+        if r.get("warning"):
+            print(f"   ⚠️  {r['warning']}", file=sys.stderr)
+
+
 def _cmd_dsar(a):
     """Find — and with --delete, erase — everything this app holds for one data subject: responses AND
     sessions (partial, retakes, every survey) in the configured store, their uploaded files, and any
@@ -1645,6 +1835,23 @@ def _cmd_dsar(a):
     Copies already delivered elsewhere — passbacks, backups, exports, downstream warehouses — are
     outside the app and still yours to erase."""
     import survey_agent.store as store_pkg
+    # 1) finish any erasure a previous run left half-done (failed blob delete, crash, …)
+    resumed = _erasure_resume_all()
+    resumed_failed = any(not r.get("complete") for r in resumed)
+    if getattr(a, "resume", False) or not a.uid:
+        if not getattr(a, "resume", False):
+            msg = "give a respondent id, or --resume to finish pending erasure jobs"
+            print(json.dumps({"error": msg}) if a.json else f"❌ {msg}")
+            return 2
+        if a.json:
+            print(json.dumps({"action": "resume", "resumed": resumed}, indent=2))
+        elif not resumed:
+            print("no pending erasure jobs.")
+        else:
+            _print_resumed(resumed)
+        return 1 if resumed_failed else 0
+    if resumed and not a.json:
+        _print_resumed(resumed)
     store = store_pkg.get_store()
     uid, sid = a.uid, (a.survey or None)
     fields, warnings = _dsar_id_fields(getattr(a, "id_field", None) or ())
@@ -1684,6 +1891,12 @@ def _cmd_dsar(a):
             if confirm.strip().lower() not in ("y", "yes"):
                 print("aborted.")
                 return 1
+        # 2) durable manifest BEFORE deleting any source record: what we learned from the lookup
+        known = store_pkg.erasure_result(rows, sessions)
+        manifest = _erasure_new(uid, sid)
+        _erasure_add(manifest, known["upload_refs"], known["webhook_keys"])
+        if _erasure_has_pending(manifest):
+            _erasure_save(manifest)
         try:
             if eraser is not None:
                 res = eraser(uid, id_fields=fields, survey_id=sid)
@@ -1693,15 +1906,24 @@ def _cmd_dsar(a):
                 warnings.append(f"the configured store ({store_name}) has only delete_responses(): "
                                 "sessions and uploaded files were NOT erased")
         except NotImplementedError as e:
+            _erasure_remove(manifest)            # nothing was erased; the lookup is repeatable
             msg = f"the configured store ({store_name}) can't erase: {e}"
             print(json.dumps({"error": msg}) if a.json else f"❌ {msg}")
             return 2
-        up_deleted, up_errors = _dsar_delete_uploads(res.get("upload_refs") or [])
-        outbox_cleared = _dsar_clear_outbox(res.get("webhook_keys") or [])
+        # 3) records are gone: fold in anything the store found that the lookup didn't (a racing
+        #    write), mark the job, then remove blobs + outbox items, ticking each off as it succeeds
+        _erasure_add(manifest, res.get("upload_refs") or [], res.get("webhook_keys") or [])
+        manifest["state"] = "records_erased"
+        if _erasure_has_pending(manifest):
+            _erasure_save(manifest)
+        job = _erasure_run(manifest)
+        up_deleted, outbox_cleared = job["uploads_deleted"], job["outbox_cleared"]
+        up_errors = job["errors"]
         out = {"action": "delete", "uid": uid, "survey_id": sid, "id_fields": fields,
                "deleted": res.get("responses", 0), "sessions_deleted": res.get("sessions", 0),
                "uploads_deleted": up_deleted, "upload_errors": up_errors,
-               "outbox_cleared": outbox_cleared, "warnings": warnings, "not_erased": _DSAR_OUTSIDE}
+               "outbox_cleared": outbox_cleared, "warnings": warnings, "not_erased": _DSAR_OUTSIDE,
+               "erasure_job": None if job["complete"] else job["job_id"], "resumed": resumed}
         if a.json:
             print(json.dumps(out, indent=2))
         else:
@@ -1709,11 +1931,15 @@ def _cmd_dsar(a):
                   f"{up_deleted} uploaded file(s), {outbox_cleared} queued webhook delivery(ies) for "
                   f"{uid!r} (matched on {', '.join(fields)}).")
             for err in up_errors:
-                print(f"   ❌ upload not erased: {err}")
+                print(f"   ❌ not erased: {err}")
+            if not job["complete"]:
+                print(f"   ❌ erasure job {job['job_id']} kept with {job['uploads_pending']} upload(s) and "
+                      f"{job['outbox_keys_pending']} outbox key(s) pending — fix the cause, then "
+                      f"`survey-agent dsar --resume`")
             for w in warnings:
                 print(f"   ⚠️  {w}")
             print(f"   {_DSAR_OUTSIDE}")
-        return 1 if up_errors else 0
+        return 1 if (up_errors or not job["complete"] or resumed_failed) else 0
 
     summary = [{"id": r.get("id"), "survey_id": r.get("survey_id"), "status": r.get("status"),
                 "date_submitted": r.get("date_submitted")} for r in rows]
@@ -1722,7 +1948,8 @@ def _cmd_dsar(a):
     if a.json:
         out = {"action": "list", "uid": uid, "survey_id": sid, "id_fields": fields,
                "count": len(rows), "responses": summary,
-               "session_count": len(sessions), "sessions": sess_summary, "warnings": warnings}
+               "session_count": len(sessions), "sessions": sess_summary, "warnings": warnings,
+               "resumed": resumed}
         if getattr(a, "full", False):
             out["records"] = {"responses": rows, "sessions": sessions}
         print(json.dumps(out, indent=2, default=str))
@@ -1737,7 +1964,7 @@ def _cmd_dsar(a):
         if rows or sessions:
             print(f"\nFull records (access copy): survey-agent dsar {uid} --json --full")
             print(f"To erase: survey-agent dsar {uid} --delete")
-    return 0
+    return 1 if resumed_failed else 0
 
 
 def _cmd_docs(a):
@@ -2169,8 +2396,12 @@ def main(argv=None):
     s.add_argument("--json", action="store_true", help="machine-readable output")
     s.set_defaults(fn=_cmd_outbox)
     s = sub.add_parser("dsar", help="find/erase a subject's data — responses, sessions, uploads (DSAR / right-to-be-forgotten)")
-    s.add_argument("uid", help="the respondent id, matched on every identity url var in use (uid, "
-                                "SURVEY_RESPONDENT_VAR, each survey's settings.identity.respondent)")
+    s.add_argument("uid", nargs="?", default=None,
+                   help="the respondent id, matched on every identity url var in use (uid, "
+                        "SURVEY_RESPONDENT_VAR, each survey's settings.identity.respondent)")
+    s.add_argument("--resume", action="store_true",
+                   help="only finish pending erasure jobs (blobs / queued webhooks left by a failed or "
+                        "interrupted --delete); every dsar run also does this first")
     s.add_argument("--survey", default=None, help="limit to one survey id (default: all surveys in the store)")
     s.add_argument("--id-field", action="append", default=[],
                    help="also match this url var name (repeatable) — e.g. an identity var from a retired survey")

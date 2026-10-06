@@ -66,7 +66,8 @@ project at a glance: its **purpose**, its **state** in the lifecycle, and whethe
   real respondents **only when a survey is `live`**. While it's still `draft`/`validated`/`tested`/
   `approved`, respondents get a *"not open yet"* page; only an operator can **preview** it (the
   console's *open as respondent* link, which collects no data). Marking live also **pins the version**
-  that went out, so a later edit doesn't change what in-field respondents see until you re-publish.
+  that went out, so a later edit doesn't change what respondents see until you launch or publish
+  it again (with approval).
   (During a migration you can temporarily widen the gate with `SURVEY_SERVE_STATES`; see below.)
 - **Purpose travels with the file.** Give each survey a one-line `description` (and optional `tags` /
   `owner`) when you author it (*"...and describe it as the Q3 streaming screener, tag it streaming"*),
@@ -79,14 +80,19 @@ project at a glance: its **purpose**, its **state** in the lifecycle, and whethe
   the projects (create one by naming it; it disappears when its last survey leaves). Use projects as
   folders and `tags` for cross-cutting descriptive labels.
 - State lives in a small `.registry.json` next to your surveys (it never touches the frozen survey
-  definitions). Commit it if you want the whole team to share status; leave it local otherwise.
+  definitions). It also records which version was approved when the survey was marked live, so if you
+  deploy surveys by git, commit it together with `surveys/.versions/`. Otherwise leave it local or
+  commit it if you want the whole team to share status.
+- **Editing a live survey doesn't change what respondents see until you approve it.** Saving or
+  bumping the file only adds a version; the runtime keeps serving the approved one until you
+  `launch`, `publish` or `status --set live` again, which pins the newest saved version.
 
 `survey-agent status <id>` shows one survey's full record (when it was tested, the incidence, where
 it's live, any note you left). The same view is available to an agent over MCP as `list_surveys`.
 
 **Pause or close fielding:** `survey-agent status <id> --set paused` stops the survey: respondents see a
-"paused" page and no new sessions start (anyone mid-survey may still finish). `--set live` resumes it,
-and `--set closed` stops it for good. (With the default file-based definitions on a hosted runtime,
+"paused" page and no new sessions start (anyone mid-survey may still finish). `--set live` resumes it
+(pinning the newest saved version), and `--set closed` stops it for good. (With the default file-based definitions on a hosted runtime,
 commit the registry change and redeploy for it to take effect; with a runtime definition store it
 applies immediately.)
 
@@ -242,8 +248,10 @@ This:
    (session key, dedup, enrichment lookup, erasure) follows it.
 3. **Publishing is a separate, explicit step**, and which step depends on `SURVEY_DEFINITION_SOURCE`:
    - **File backend (default):** the survey is reachable once your hosted runtime is *deployed* with its
-     file: `git push` to your deploy repo (or `survey-agent launch --deploy`, which runs your configured
-     `deploy.command` / `$SURVEY_DEPLOY_COMMAND`).
+     file, `surveys/.versions/` and `surveys/.registry.json`: `git push` to your deploy repo (or
+     `survey-agent launch --deploy`, which runs your configured `deploy.command` /
+     `$SURVEY_DEPLOY_COMMAND`). An edited file that ships without a new `launch` keeps serving the
+     version approved last time.
    - **Runtime store (`mongo` / `http` / custom):** `survey-agent publish <survey.json>` stores the
      definition and marks it live **with no redeploy** (version-pinned; the file stays the backup).
 
@@ -356,7 +364,9 @@ with `?theme=dark`. To add your own, point `SURVEY_THEMES_DIR` at a folder of th
 | **Incidence way lower than expected** | Screen-out logic too strict, or a quota set too low. Check the screen-out reasons in the report. |
 | **A behavior question shows blank** (`searched for ""`) | There's no matching data for that respondent in the window. The page should be **gated** so it only appears when the fact exists, or the pipe given a fallback. Ask Claude to gate it. |
 | **People route to the wrong place** | The `complete` action's redirect URL is wrong; `/edit-survey` to fix the route. |
-| **Survey edited but live respondents seem unaffected** | Correct: edits create a *new version*; in-flight respondents stay on the version they started. New starts get the new one after you re-publish. |
+| **Survey edited but live respondents seem unaffected** | Correct: edits create a *new version*; in-flight respondents stay on the version they started. New starts get the new one only after an approved `launch`, `publish` or `status --set live`; deploying the edited file alone keeps serving the approved version. |
+| **Survey returns 404 after a deploy** | With file definitions, `surveys/.registry.json` pins a version whose snapshot in `surveys/.versions/` wasn't deployed. Commit and deploy the two together. |
+| **Every link shows "Signed links are required but not configured"** | The survey sets `settings.url_signing.required` but the runtime has no `SURVEY_URL_SECRET`, so it refuses all invitations. Set the secret on the runtime (the same one `sign-url` uses). |
 | **Respondent sees "This survey was updated"** | The version they started isn't available on the runtime (with file definitions, `surveys/.versions/` wasn't deployed). Reopening their invitation link restarts them on the live version. Commit `surveys/.versions/` with your surveys. |
 | **Respondents see "not open yet"** | The survey isn't `live`. Mark it live (`/launch-survey` or `survey-agent status <id> --set live`) and publish it. |
 | **No completes showing in the report** | Confirm the survey is live and published, that the report reads the same store the runtime writes to (`SURVEY_STORE`), and that the link you handed out points at your hosted runtime. |

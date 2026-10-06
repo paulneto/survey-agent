@@ -51,8 +51,10 @@ Everything runs **offline** without an API key (a deterministic stub backs the A
   (`simulate.py answer_question`), export (`exporting.py` / `engine/export.py`), the schema, **and a
   test**. Run `validate` + `simulate` on a survey that uses it.
 - **A store** → implement the store contract (the methods listed in `store/__init__.py`, including
-  `reserve_quotas` for atomic all-or-nothing quota reservation, and `find_respondent` /
-  `erase_respondent` for DSAR access and erasure across responses and sessions) and point
+  `reserve_quotas(survey_id, version, limits, key=None)` for atomic all-or-nothing quota reservation
+  that returns the first outcome again for a repeated `key`, `record_response` as an upsert keyed by
+  the response `id`, and `find_respondent` / `erase_respondent` for DSAR access and erasure across
+  responses and sessions) and point
   `SURVEY_STORE` at `your_pkg.module:YourStore`. Built in:
   `memory`, `file` (the default), `sqlite`, `http`, plus a reference `mongo`; more database adapters
   belong in their own packages.
