@@ -121,8 +121,11 @@ First public release.
   identity variable in use (`--id-field` adds more; `--json --full` gives the access copy), and
   `--delete` erases them along with their uploaded files and queued webhook deliveries. Copies
   delivered outside the app (passbacks, backups, exports, logs, warehouses) must be erased there.
-  Erasure writes a durable job manifest first (no answers, no raw subject id); a failed blob or
-  outbox removal exits non-zero and keeps it, and the next `dsar` run (or `dsar --resume`) retries.
+  Erasure writes a durable job manifest first (the subject id and identity fields so it can be
+  retried, never answers; mode 0600, deleted when the job completes). A job is complete only once
+  the store confirms the records are erased and every file and queued delivery is gone; until then
+  `dsar` exits non-zero and the next run (or `dsar --resume`) finishes it, re-running the record
+  erasure if it was interrupted.
   `backup` / `restore` for responses (restore never duplicates a response); `defs-export` / `defs-import` / `defs-diff` for definitions.
 - `doctor` (resolved install, configuration and deployment checks), `help`, `docs`, `init`,
   `selftest`.

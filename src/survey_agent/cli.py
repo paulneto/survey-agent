@@ -1740,12 +1740,16 @@ def _erasure_add(m, refs=(), keys=()):
             m["pending"]["webhook_keys"].append(k)
 
 
-def _erasure_new(uid, survey_id):
+def _erasure_new(uid, survey_id, id_fields=("uid",)):
+    """A new erasure job. It records the subject id + identity fields + scope (and never any answers)
+    so an interrupted job can re-run the record erasure itself; the file is 0600 and is deleted as soon
+    as the job completes, so the id is only on disk while an erasure is unfinished."""
     import secrets
     now = _utcnow()
     return {"version": _ERASURE_VERSION,
             "job_id": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(6),
-            "subject_sha256": _subject_hash(uid), "survey_id": survey_id,
+            "subject_sha256": _subject_hash(uid), "subject": str(uid), "id_fields": list(id_fields),
+            "survey_id": survey_id,
             "state": "erasing_records", "created_at": now, "updated_at": now,
             "pending": {"upload_refs": [], "webhook_keys": []},
             "done": {"uploads_deleted": 0, "outbox_cleared": 0}, "errors": []}
@@ -1755,11 +1759,38 @@ def _erasure_has_pending(m):
     return bool(m["pending"]["upload_refs"] or m["pending"]["webhook_keys"])
 
 
+def _erasure_erase_records(m):
+    """Finish the record erasure of a job interrupted before the store confirmed it. Returns an error
+    string, or None once the store has confirmed (state -> records_erased)."""
+    if not m.get("subject"):
+        return ("records not confirmed erased and this job has no subject to retry with — re-run "
+                "`survey-agent dsar <uid> --delete` for the subject")
+    import survey_agent.store as store_pkg
+    store = store_pkg.get_store()
+    eraser = getattr(store, "erase_respondent", None)
+    if eraser is None:
+        return "the configured store has no erase_respondent() — records can't be confirmed erased"
+    try:
+        res = eraser(m["subject"], id_fields=tuple(m.get("id_fields") or ("uid",)),
+                     survey_id=m.get("survey_id"))
+    except Exception as e:  # noqa: BLE001 - keep the job pending, report why
+        return f"record erasure failed: {e}"
+    _erasure_add(m, res.get("upload_refs") or [], res.get("webhook_keys") or [])
+    m["state"] = "records_erased"
+    _erasure_save(m)
+    return None
+
+
 def _erasure_run(m):
-    """Remove every pending blob and outbox item in `m`, persisting progress after each success. When
-    nothing is left (and the records are known erased) the manifest is deleted. Returns a report dict;
-    `complete` is False when anything is still pending."""
+    """Finish job `m`: confirm the records are erased (re-running the store erasure if the job was
+    interrupted before that), then remove every pending blob and outbox item, persisting progress after
+    each success. The manifest is deleted only when the records are confirmed erased AND nothing else
+    is pending. Returns a report dict; `complete` is False otherwise."""
     errors = []
+    if m.get("state") != "records_erased":
+        err = _erasure_erase_records(m)
+        if err:
+            errors.append(err)
     for ref in list(m["pending"]["upload_refs"]):
         _, errs = _dsar_delete_uploads([ref])
         if errs:
@@ -1776,11 +1807,8 @@ def _erasure_run(m):
         except Exception as e:  # noqa: BLE001
             errors.append(f"outbox: {e}")
     warn = None
-    if m.get("state") != "records_erased":
-        warn = ("this job was interrupted before the store confirmed the records were erased — re-run "
-                "`survey-agent dsar <uid> --delete` for the subject to make sure they are gone")
     m["errors"] = errors
-    complete = not _erasure_has_pending(m)
+    complete = m.get("state") == "records_erased" and not _erasure_has_pending(m)
     if complete:
         _erasure_remove(m)
     else:
@@ -1790,6 +1818,7 @@ def _erasure_run(m):
             "outbox_cleared": m["done"]["outbox_cleared"],
             "uploads_pending": len(m["pending"]["upload_refs"]),
             "outbox_keys_pending": len(m["pending"]["webhook_keys"]),
+            "records_confirmed": m.get("state") == "records_erased",
             "errors": errors, "warning": warn}
 
 
@@ -1817,7 +1846,8 @@ def _print_resumed(resumed):
             print(f"✅ finished pending erasure job {r['job_id']} ({r.get('uploads_deleted', 0)} uploaded "
                   f"file(s), {r.get('outbox_cleared', 0)} queued webhook delivery(ies) removed)")
         else:
-            print(f"❌ erasure job {r['job_id']} still incomplete: {r.get('uploads_pending', '?')} "
+            recs = "" if r.get("records_confirmed", True) else "records not yet confirmed erased, "
+            print(f"❌ erasure job {r['job_id']} still incomplete: {recs}{r.get('uploads_pending', '?')} "
                   f"upload(s), {r.get('outbox_keys_pending', '?')} outbox key(s) pending — "
                   f"retry with `survey-agent dsar --resume`", file=sys.stderr)
             for e in r.get("errors") or []:
@@ -1893,10 +1923,9 @@ def _cmd_dsar(a):
                 return 1
         # 2) durable manifest BEFORE deleting any source record: what we learned from the lookup
         known = store_pkg.erasure_result(rows, sessions)
-        manifest = _erasure_new(uid, sid)
+        manifest = _erasure_new(uid, sid, fields)
         _erasure_add(manifest, known["upload_refs"], known["webhook_keys"])
-        if _erasure_has_pending(manifest):
-            _erasure_save(manifest)
+        _erasure_save(manifest)                  # always: a record-only job must be resumable too
         try:
             if eraser is not None:
                 res = eraser(uid, id_fields=fields, survey_id=sid)
@@ -1914,8 +1943,7 @@ def _cmd_dsar(a):
         #    write), mark the job, then remove blobs + outbox items, ticking each off as it succeeds
         _erasure_add(manifest, res.get("upload_refs") or [], res.get("webhook_keys") or [])
         manifest["state"] = "records_erased"
-        if _erasure_has_pending(manifest):
-            _erasure_save(manifest)
+        _erasure_save(manifest)
         job = _erasure_run(manifest)
         up_deleted, outbox_cleared = job["uploads_deleted"], job["outbox_cleared"]
         up_errors = job["errors"]

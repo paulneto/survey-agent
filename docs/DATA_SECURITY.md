@@ -145,11 +145,13 @@ The `video` type is display-only and stores no respondent data, but it embeds th
   files and downstream warehouses. The command says so when it finishes.
 - **Erasure is resumable.** Before `dsar --delete` deletes any record, it writes a job manifest to
   `$SURVEY_ERASURE_DIR` (default `<SURVEY_DATA_DIR>/erasure/`, mode 0600) listing the uploaded files
-  and queued webhook deliveries still to remove. It holds a hash of the subject id, never the raw id
-  or any answers, and is deleted once everything is gone. If a removal fails, the command exits
-  non-zero and keeps the manifest; every later `dsar` run retries unfinished jobs first, and
-  `survey-agent dsar --resume` retries them without looking anyone up. Nothing is written when there
-  are no files or queued deliveries to remove.
+  and queued webhook deliveries still to remove. It holds the subject id, the identity fields and
+  the survey scope (so an interrupted record erasure can be re-run), never any answers, and it is
+  deleted as soon as the job completes, so the id is on disk only while an erasure is unfinished. A
+  job is complete only when the store has confirmed the records are erased AND every file and queued
+  delivery is gone. Until then the command exits non-zero and keeps the manifest; every later `dsar`
+  run finishes unfinished jobs first (re-running the record erasure if it was interrupted), and
+  `survey-agent dsar --resume` does only that. Record-only erasures get a manifest too.
 - **Retention:** survey-agent does not expire responses or sessions. Define a retention policy and
   enforce it (e.g. a scheduled `dsar --delete`, or store-level TTLs).
 

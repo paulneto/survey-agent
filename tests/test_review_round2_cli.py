@@ -1,5 +1,5 @@
 """Review round 2, N5: DSAR erasure is a durable job. Before any source record is deleted, the CLI
-persists an erasure manifest (upload refs + outbox idempotency keys + a subject hash — never answers);
+persists an erasure manifest (subject id + identity fields + scope, upload refs, outbox idempotency keys — never answers);
 blobs and queued webhooks are removed and ticked off one by one; the manifest is deleted only when
 everything is gone. A failed delete or a crash leaves the manifest, and `dsar --resume` (or any later
 `dsar` run) finishes the job. All data here is synthetic and lives under tmp_path."""
@@ -97,7 +97,9 @@ def test_failed_blob_delete_keeps_manifest_and_resume_finishes(env, monkeypatch,
     assert stat.S_IMODE(os.stat(mpath).st_mode) == 0o600
     assert stat.S_IMODE(os.stat(env.erasure).st_mode) == 0o700
     raw = mpath.read_text()
-    assert "SECRET-ANSWER" not in raw and "u-1" not in raw
+    assert "SECRET-ANSWER" not in raw                     # never answers
+    m = json.loads(raw)                                     # the subject id is kept (0600) only so an
+    assert m["subject"] == "u-1" and m["id_fields"]          # interrupted record erasure can be retried
     m = json.loads(raw)
     assert m["state"] == "records_erased" and m["subject_sha256"] == cli._subject_hash("u-1")
     assert [r["key"] for r in m["pending"]["upload_refs"]] == [env.refs[0]["key"]]
@@ -172,13 +174,57 @@ def test_crash_during_record_erasure_leaves_manifest_written_first(env, monkeypa
     for k, v in {"SURVEY_STORE": "file", "SURVEY_DATA_DIR": str(env.data), "SURVEY_UPLOAD_STORE": "local",
                  "SURVEY_UPLOAD_DIR": str(env.ups), "SURVEY_OUTBOX_DIR": str(env.obx)}.items():
         monkeypatch.setenv(k, v)
-    # resume clears the blobs/outbox but warns that the records may not be erased …
+    # resume re-runs the record erasure itself, and only then reports the job complete
     assert main(["dsar", "--resume", "--json"]) == 0
     res = json.loads(capsys.readouterr().out)["resumed"][0]
-    assert res["complete"] and res["warning"]
-    # … and re-running the subject's erasure finishes the records
-    assert main(["dsar", "u-1", "--delete", "--yes", "--json"]) == 0
+    assert res["complete"] and res["records_confirmed"]
     _assert_records_gone(env)
+    assert env.manifests() == []
+
+
+def test_resume_never_reports_complete_while_records_remain(env, monkeypatch, capsys):
+    """Round-3 review: a job interrupted before the store confirmed the records are erased must stay
+    pending (non-zero exit, manifest kept) until a retry of the record erasure succeeds."""
+    def boom(self, *a, **kw):
+        raise KeyboardInterrupt("simulated crash before records are erased")
+    monkeypatch.setattr(FileStore, "erase_respondent", boom)
+    with pytest.raises(KeyboardInterrupt):
+        main(["dsar", "u-1", "--delete", "--yes", "--json"])
+    # the store keeps failing → resume must not succeed, must keep the manifest, records still there
+    def fail(self, *a, **kw):
+        raise OSError("synthetic store outage")
+    monkeypatch.setattr(FileStore, "erase_respondent", fail)
+    assert main(["dsar", "--resume", "--json"]) == 1
+    res = json.loads(capsys.readouterr().out)["resumed"][0]
+    assert not res["complete"] and not res["records_confirmed"]
+    assert len(env.manifests()) == 1
+    # store recovers → resume finishes everything and only then removes the manifest
+    monkeypatch.undo()
+    for k, v in {"SURVEY_STORE": "file", "SURVEY_DATA_DIR": str(env.data), "SURVEY_UPLOAD_STORE": "local",
+                 "SURVEY_UPLOAD_DIR": str(env.ups), "SURVEY_OUTBOX_DIR": str(env.obx)}.items():
+        monkeypatch.setenv(k, v)
+    assert main(["dsar", "--resume", "--json"]) == 0
+    _assert_records_gone(env)
+    assert env.manifests() == []
+
+
+def test_record_only_erasure_is_resumable(env, monkeypatch, capsys):
+    """A subject with no uploads and no queued deliveries still gets a manifest before deletion."""
+    from survey_agent.store.file import FileStore as FS
+    st = FS(str(env.data))
+    st.record_response("s", {"id": "plain-1", "status": "Complete", "url_variables": {"uid": "u-plain"}})
+    def boom(self, *a, **kw):
+        raise KeyboardInterrupt("crash")
+    monkeypatch.setattr(FileStore, "erase_respondent", boom)
+    with pytest.raises(KeyboardInterrupt):
+        main(["dsar", "u-plain", "--delete", "--yes", "--json"])
+    assert len(env.manifests()) == 1
+    monkeypatch.undo()
+    for k, v in {"SURVEY_STORE": "file", "SURVEY_DATA_DIR": str(env.data), "SURVEY_UPLOAD_STORE": "local",
+                 "SURVEY_UPLOAD_DIR": str(env.ups), "SURVEY_OUTBOX_DIR": str(env.obx)}.items():
+        monkeypatch.setenv(k, v)
+    assert main(["dsar", "--resume", "--json"]) == 0
+    assert not [r for r in st.list_responses() if (r.get("url_variables") or {}).get("uid") == "u-plain"]
     assert env.manifests() == []
 
 

@@ -266,11 +266,12 @@ Three parts of the contract carry correctness guarantees:
 `survey-agent dsar <id> [--survey ID] --delete` uses these to erase a subject's responses, sessions,
 uploaded files and queued webhook deliveries uniformly. Before it deletes any record it writes an
 erasure job manifest (`$SURVEY_ERASURE_DIR`, default `<SURVEY_DATA_DIR>/erasure/`, file mode 0600)
-listing the upload refs and outbox keys still to remove, plus a hash of the subject id; no answers
-and no raw id. It ticks items off as they are removed and deletes the manifest when nothing is left.
-If a blob or outbox removal fails, the command exits non-zero and keeps the manifest; every later
-`dsar` run retries unfinished jobs first, and `dsar --resume` only retries. (No manifest is written
-when there's nothing outside the store to remove.) Backups, exports, passbacks already delivered,
+holding the subject id, identity fields and scope (never answers) plus the upload refs and outbox keys
+still to remove. The job is complete only when the store confirms the records are erased and nothing
+else is pending; then the manifest is deleted. If the run is interrupted before the store confirms,
+or a blob/outbox removal fails, the command exits non-zero and keeps the manifest; every later `dsar`
+run finishes unfinished jobs first (re-running the record erasure when needed), and `dsar --resume`
+does only that. Backups, exports, passbacks already delivered,
 and any copies in your downstream systems remain your responsibility.
 
 **Completions are retry-safe.** At a terminal the runtime first saves the session with the ending it
