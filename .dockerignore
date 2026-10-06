@@ -1,0 +1,38 @@
+# Deny-by-default build context. Git ignore rules do NOT apply to `docker build`, so without this
+# `COPY . .` would bake .git, .env files, survey_data/ (responses, sessions, uploads), exports/reports,
+# overlays, reference material, local DBs/backups and caches into the image. Everything is excluded,
+# then exactly what the image needs is re-included. Add a path here only if the runtime reads it.
+*
+
+# --- what `pip install .` needs to build the package
+!src
+!pyproject.toml
+!README.md
+!LICENSE
+!NOTICE
+!MANIFEST.in
+!CHANGELOG.md
+
+# --- what the runtime serves from /app (SURVEY_DIR=surveys; the sidecar reads SURVEY_TRIGGERS_DIR)
+!surveys/*.survey.json
+!surveys/*.md
+# file-based lifecycle state: the runtime only serves `live` surveys, and "live" is recorded here
+!surveys/.registry.json
+# immutable per-version snapshots: respondents mid-survey stay pinned to the version they started on
+!surveys/.versions
+!surveys/.versions/**
+!triggers/*.json
+
+# --- never, even inside an allowed directory (these rules come last so they win)
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+**/.DS_Store
+**/*.local.md
+**/.env
+**/.env.*
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.sqlite-*
+**/*.bak

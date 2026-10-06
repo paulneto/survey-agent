@@ -55,28 +55,56 @@ def _auth_active(store=None) -> bool:
     return False
 
 
-# Fail loud: a deployer who wires up Google OAuth but leaves the session key as the dev placeholder
-# (or unset) would have forgeable sessions. Refuse to start rather than silently accept that.
-if _authcfg.oauth_configured() and _authcfg.SESSION_JWT_KEY in ("", _authcfg.DEV_SESSION_KEY):
+# Fail loud: a deployer who wires up Google OAuth but leaves the session key as the dev placeholder,
+# unset, or too short would have forgeable sessions. Refuse to start rather than silently accept that.
+# (Without OAuth, session cookies are ignored entirely — see `auth.config.session_auth_enabled`.)
+if _authcfg.oauth_configured() and not _authcfg.session_key_strong():
     raise SystemExit(
-        "SURVEY_GOOGLE_CLIENT_ID/SECRET are set but SURVEY_SESSION_JWT_KEY is unset or still the dev "
-        "placeholder — OAuth sessions would be forgeable. Set SURVEY_SESSION_JWT_KEY to a strong secret."
+        "SURVEY_GOOGLE_CLIENT_ID/SECRET are set but SURVEY_SESSION_JWT_KEY is unset, still the dev "
+        f"placeholder, or shorter than {_authcfg.MIN_SESSION_KEY_LEN} characters — OAuth sessions would "
+        "be forgeable. Set SURVEY_SESSION_JWT_KEY to a strong random secret "
+        "(e.g. `python -c 'import secrets; print(secrets.token_urlsafe(48))'`)."
     )
 
-# The OAuth + /keys routers are always mounted: the login/callback routes self-gate (503 when OAuth
-# is unconfigured) and Authlib is imported lazily inside them, so mounting costs nothing in token-only
-# mode. Only the SessionMiddleware — which Authlib needs to stash the OAuth state/nonce (a signed
-# cookie via itsdangerous) across the redirect — is gated on OAuth being configured, so no
-# itsdangerous/Authlib import happens when OAuth is off.
-from survey_agent.api.auth import keys_ui as _keys_ui  # noqa: E402  (self-gating routes, lazy heavy deps)
+
+def _missing_auth_deps() -> list:
+    """The [auth]-extra modules that aren't importable (PyJWT, python-multipart, Authlib, itsdangerous)."""
+    import importlib.util
+    mods = {"jwt": "PyJWT", "multipart": "python-multipart", "authlib": "Authlib",
+            "itsdangerous": "itsdangerous"}
+    missing = []
+    for mod, pkg in mods.items():
+        try:
+            found = importlib.util.find_spec(mod) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(pkg)
+    return missing
+
+
+# The OAuth login/callback routes are always mounted: they self-gate (503 when OAuth is unconfigured)
+# and import Authlib lazily, so they cost nothing in token-only mode. The /keys UI (create/revoke API
+# keys) needs a signed-in human and python-multipart for its form, so it is mounted ONLY when Google
+# sign-in is configured — and imported lazily here, so a gateway installed with just `[api]` (bearer
+# token / API-key mode) imports and starts without the `[auth]` extra. SessionMiddleware (Authlib's
+# OAuth state/nonce across the redirect) is likewise gated on OAuth.
 from survey_agent.api.auth import oauth as _oauth  # noqa: E402
 
 app.include_router(_oauth.router)
-app.include_router(_keys_ui.router)
 
 if _authcfg.oauth_configured():
+    _missing = _missing_auth_deps()
+    if _missing:
+        raise SystemExit(
+            "Google sign-in is configured (SURVEY_GOOGLE_CLIENT_ID/SECRET) but the [auth] extra is "
+            f"missing ({', '.join(_missing)}): pip install 'survey-agent[api,auth]'"
+        )
     from starlette.middleware.sessions import SessionMiddleware
 
+    from survey_agent.api.auth import keys_ui as _keys_ui
+
+    app.include_router(_keys_ui.router)
     app.add_middleware(SessionMiddleware, secret_key=_authcfg.SESSION_JWT_KEY,
                        https_only=True, same_site="lax")
 
@@ -185,11 +213,59 @@ def get_registry(survey_id: str):
     return reg
 
 
+# Registry fields a client may write through the gateway, each with its accepted JSON type(s). Anything
+# else is rejected (400) — the registry drives lifecycle state, so it is not a free-form bag.
+_REGISTRY_FIELDS = {
+    "status": (str,),
+    "note": (str, type(None)),
+    "project": (str, type(None)),
+    "live": (dict, type(None)),
+    "live_version": (int, type(None)),
+    "validated": (dict, type(None)),
+    "tested": (dict, type(None)),
+}
+# Fields that set or change WHAT is live (the state itself, its launch stamp/url, the pinned version).
+_LIVE_FIELDS = ("status", "live", "live_version")
+
+
+def _check_registry_fields(fields: dict) -> None:
+    from survey_agent import registry as _registry
+    unknown = sorted(set(fields) - set(_REGISTRY_FIELDS))
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"unknown registry field(s): {', '.join(unknown)}; "
+                                                    f"allowed: {', '.join(sorted(_REGISTRY_FIELDS))}")
+    for k, v in fields.items():
+        if not isinstance(v, _REGISTRY_FIELDS[k]) or (k == "live_version" and isinstance(v, bool)):
+            raise HTTPException(status_code=400, detail=f"registry field {k!r} has the wrong type")
+    if "status" in fields and fields["status"] not in _registry.STATES:
+        raise HTTPException(status_code=400, detail=f"unknown status {fields['status']!r}; "
+                                                    f"choose one of: {', '.join(_registry.STATES)}")
+    if isinstance(fields.get("live_version"), int) and fields["live_version"] < 1:
+        raise HTTPException(status_code=400, detail="live_version must be >= 1")
+
+
+def _is_live(entry: dict) -> bool:
+    from survey_agent import registry as _registry
+    return _registry.derived_state(entry or {}) == "live"
+
+
 @v1.post("/registry/{survey_id}")
 async def set_registry(survey_id: str, request: Request):
-    fields = dict(await request.json() or {})
+    body = await request.json()
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="registry update must be a JSON object")
+    fields = dict(body)
     approve = fields.pop("approve", None) or request.headers.get("x-survey-launch-approval")
-    if fields.get("status") == "live":       # marking live goes through the same gate as every surface
+    _check_registry_fields(fields)
+    # Gate on the RESULTING state, not just an explicit `status: live` — the registry also derives
+    # `live` from signals like `live.at`, so judge the merged entry exactly as the store will see it.
+    prior = _defs().get_registry(survey_id) or {}
+    # (A store's reported `status` may itself be derived, e.g. "tested"; non-terminal states fall
+    # through to the `live.at` inference in derived_state, so merging over it judges correctly.)
+    result = {**prior, **fields}
+    if _is_live(result) and (not _is_live(prior) or any(k in fields for k in _LIVE_FIELDS)):
         from survey_agent.config import may_mark_live
         ok, reason = may_mark_live(approve, surface="api")
         if not ok:

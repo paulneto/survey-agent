@@ -31,7 +31,8 @@ That shapes the security boundary:
 
 Defense-in-depth still applies to operator input where it's cheap. In the reference warehouse
 adapter, SQL identifiers are validated and values are parameterized; regexes in validation and logic
-are length/complexity-bounded at validate time and their input is length-capped.
+are length/complexity-bounded at validate time, their input is length-capped, and every match runs
+with a 50 ms timeout (the `regex` engine).
 
 ## Who it's for: two roles in one workflow
 
@@ -91,7 +92,9 @@ The respondent runtime keeps a direct store on the hot path; the gateway is not 
 request path.
 
 **The gateway runs open unless you configure auth**: a bearer `SURVEY_API_TOKEN`, Google OAuth (the
-`[auth]` extra), or `sa_` API keys. Configure one before exposing it.
+`[auth]` extra), or `sa_` API keys. Configure one before exposing it. Session cookies are honoured
+only when Google sign-in is configured with a strong session key; in every other mode they're
+ignored, so a cookie signed with the public dev key can't authenticate.
 
 ## `live` is the serving gate
 
@@ -107,7 +110,9 @@ mean what operators expect: deployed and collecting.
   `SURVEY_SERVE_STATES=*`, which the CLI refuses to combine with public hosting.
 - **Marking live pins the version.** With the `mongo` definition source, respondents get the
   `live_version` until a re-publish; edits create a new draft version that doesn't reach the field
-  until then. The `file` backend is one version per file, so it serves the current file.
+  until then. The `file` backend serves the current file as the live version and keeps every version
+  it has served or published as an immutable snapshot in `<SURVEY_DIR>/.versions/<id>/`, so in-flight
+  sessions still finish on the version they started.
 - **Unmanaged surveys are served.** A survey with no registry state (the single-file `serve` path) is
   served as before; the gate applies once a lifecycle state exists. `SURVEY_SERVE_STATES` is also the
   lever for widening the gate temporarily during a migration.

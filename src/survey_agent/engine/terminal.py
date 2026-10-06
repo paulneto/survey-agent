@@ -27,10 +27,23 @@ def idempotency_key(response_id, status):
     return hashlib.sha256(f"{response_id}|{status}".encode()).hexdigest()
 
 
+def passback_url_vars(session):
+    """The captured url vars that may leave the system in a passback event: only the survey's
+    declared `settings.url_variables` + identity vars (recorded on the session as `passback_vars` by
+    `SurveyRuntime.new_session`). An incidental/sensitive query param on the invite link is still
+    captured in the stored response's `url_variables` (the drop-in contract) but is never forwarded.
+    Sessions without the allowlist (legacy/synthetic dicts) forward everything, as before."""
+    uv = dict(session.get("url_vars", {}) or {})
+    allow = session.get("passback_vars")
+    if allow is None:
+        return uv
+    return {k: v for k, v in uv.items() if k in set(allow)}
+
+
 def build_event(session, status, reason_code=None):
-    """A neutral terminal/started event. `url_variables` carries whatever the survey_url passed
-    (uid/rid/group/utm/…); the engine hardcodes no param names. Integrations map this to their
-    own wire format."""
+    """A neutral terminal/started event. `url_variables` carries the survey's declared url vars +
+    identity vars from the survey_url (uid/rid/group/utm/…, see passback_url_vars); the engine
+    hardcodes no param names. Integrations map this to their own wire format."""
     rid = response_id(session)
     return {
         "event": STATUS_TO_EVENT.get(status, status),
@@ -38,6 +51,6 @@ def build_event(session, status, reason_code=None):
         "reason_code": reason_code,
         "survey_id": session.get("survey_id"),
         "response_id": rid,
-        "url_variables": dict(session.get("url_vars", {})),
+        "url_variables": passback_url_vars(session),
         "idempotency_key": idempotency_key(rid, status),
     }

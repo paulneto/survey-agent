@@ -317,6 +317,11 @@ single-select, multi-select, number, and text questions. **Grids, rankings, and 
 supported in conversation mode**; use the form for surveys that need them. Because an AI reads the
 replies, disclose that to respondents in your consent text (see below).
 
+`convo` and the browser chat at `/chat` (served by `demo` and `serve --preview`, or with
+`SURVEY_CHAT_DEMO=1`) are previews and record nothing. To collect answers conversationally, an agent
+runs the survey with the MCP `begin_survey` / `answer_survey` tools and gets the structured result
+back (see [PRIMITIVE.md](PRIMITIVE.md)); for stored responses, field the form.
+
 ## Hidden values & scoring
 
 You can compute **hidden fields** that respondents never see but that get stored on the response,
@@ -352,6 +357,7 @@ with `?theme=dark`. To add your own, point `SURVEY_THEMES_DIR` at a folder of th
 | **A behavior question shows blank** (`searched for ""`) | There's no matching data for that respondent in the window. The page should be **gated** so it only appears when the fact exists, or the pipe given a fallback. Ask Claude to gate it. |
 | **People route to the wrong place** | The `complete` action's redirect URL is wrong; `/edit-survey` to fix the route. |
 | **Survey edited but live respondents seem unaffected** | Correct: edits create a *new version*; in-flight respondents stay on the version they started. New starts get the new one after you re-publish. |
+| **Respondent sees "This survey was updated"** | The version they started isn't available on the runtime (with file definitions, `surveys/.versions/` wasn't deployed). Reopening their invitation link restarts them on the live version. Commit `surveys/.versions/` with your surveys. |
 | **Respondents see "not open yet"** | The survey isn't `live`. Mark it live (`/launch-survey` or `survey-agent status <id> --set live`) and publish it. |
 | **No completes showing in the report** | Confirm the survey is live and published, that the report reads the same store the runtime writes to (`SURVEY_STORE`), and that the link you handed out points at your hosted runtime. |
 | **Your system isn't hearing about completes** | Check `SURVEY_INTEGRATION` is set (unset means no passback) and its URL/secret settings. `survey-agent doctor` shows the resolved config. |

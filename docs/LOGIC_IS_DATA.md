@@ -9,8 +9,8 @@ never code that the engine runs.
 
 Authoring a survey means writing a JSON file. It never means writing Python, and it never means
 deploying new code. Ten thousand surveys are ten thousand JSON files run by the same engine: about
-2,600 lines of pure Python whose only dependencies are the standard library plus `jsonschema` and
-`PyYAML`.
+2,700 lines of pure Python whose only dependencies are the standard library plus `jsonschema`,
+`PyYAML` and `regex`.
 
 Think of **SQL**: one engine, infinite queries. You write a query (data); you don't ship a program.
 
@@ -94,7 +94,7 @@ Every existing survey kept working untouched, and every future survey can repeat
 | **The agent authoring the survey** | Precise, machine-readable errors and a behavioural simulation to check its work against, so it can draft, test and fix a survey without a human debugging it. |
 | **Engineers and deployers** | One small engine to read, test and audit. The test suite tests the *interpreter*; survey #10,000 adds no new code paths and needs no new tests. Upgrading the engine upgrades every survey. |
 | **Security reviewers** | The engine never executes anything from a survey definition: logic is a closed tree with no `eval`. LLM output is gated by a JSON Schema and a validator before it runs. A reviewer reads the engine once instead of per survey. |
-| **Teams** | Surveys are documents: diffable in a PR, versioned, and analyzable in bulk. With a runtime definition source (`mongo`, `http`), a published version is immutable and in-flight respondents stay on the version they started. No per-survey deploy. |
+| **Teams** | Surveys are documents: diffable in a PR, versioned, and analyzable in bulk. A published version is immutable and in-flight respondents stay on the version they started (the `file` source keeps version snapshots in `surveys/.versions/`). With a runtime definition source (`mongo`, `http`) there's no per-survey deploy. |
 
 The cost is that you can't express *everything* inline. §8 covers what happens then.
 
@@ -162,13 +162,19 @@ ever sees it.
 | `greater_or_equal` | numeric | ” |
 | `less_or_equal` | numeric | ” |
 | `between` | numeric | `"value": [lo, hi]`, inclusive both ends |
-| `regex_match` | string | `re.search` semantics. `validate` rejects patterns over 200 characters or with nested unbounded quantifiers (`(x+)+`), at most 2,000 characters of input are matched, and a refused or invalid pattern yields `false` |
+| `regex_match` | string | `re.search` semantics. `validate` rejects patterns over 200 characters, with nested unbounded quantifiers (`(x+)+`), or with an alternation inside a repeated group (`(a\|aa)+`). At most 2,000 characters of input are matched, each match has a 50 ms timeout, and a refused, invalid or timed-out pattern yields `false` |
 | `is_full` | `quota` ref | `limit` is set **and** `count >= limit` |
 | `is_not_full` | `quota` ref | no `limit`, **or** `count < limit` |
 
 On a `quota` ref, any operator other than `is_full`/`is_not_full` compares against the quota's
 `count`, so `{"kind":"quota", ..., "operator":"greater_than", "value":100}` is legal and means
 "more than 100 in this cell so far".
+
+`is_full` reads a snapshot, so two respondents can both pass it while racing for the last slot. The
+runtime settles that at completion: a `complete` atomically reserves a slot in every quota bucket the
+session falls into, all or nothing, and if any bucket is full the completion becomes the survey's
+`overquota` ending (its message or redirect) instead. A session's ending is processed once. Any
+`webhook` action earlier in the survey may already have fired by then.
 
 ### `action.type` — what logic can *do* (6)
 
@@ -223,8 +229,9 @@ These are deliberate, centralized decisions. Get them wrong and your logic silen
 - **Blank-answer convention.** A comparison against an unanswered or blank value is **`False`** —
   logic only fires when there is data. The two exceptions are `is_answered` (returns `False`) and
   `is_not_answered` (returns `True`), which are evaluated *before* the blank check.
-- **Fail closed on malformed input.** An invalid or refused regex, or a `between` whose bound isn't a 2-element
-  list, returns `False` rather than raising. Bad data never takes a respondent down a path.
+- **Fail closed on malformed input.** An invalid, refused or timed-out regex, or a `between` whose
+  bound isn't a 2-element list, returns `False` rather than raising. Bad data never takes a respondent
+  down a path.
 - **`equals` is set-based.** Right for `checkbox`; wrong for `ranking`. Use `equals_ordered` there.
 - **Omit the key; don't write `{}`.** The evaluator treats an empty node as "always true", but the
   **schema rejects a literal `"display_logic": {}`**. To mean "always show", leave the key out
@@ -337,8 +344,8 @@ Never launch on `validate` alone.
 The reasoning at the top of this document, restated as properties you can check in the code:
 
 - **No execution path from a definition.** `grep` the engine: no `eval`, no `exec`, and no
-  dependencies beyond the standard library, `jsonschema` and `PyYAML`. A survey can only select
-  among behaviours the engine already has.
+  dependencies beyond the standard library, `jsonschema`, `PyYAML` and `regex`. A survey can only
+  select among behaviours the engine already has.
 - **Statically checkable.** §5: every reference is checked before the survey fields.
 - **Simulatable.** `simulate --n 500` uses the same `SurveyRuntime` the web server uses, so coverage
   results are about the real engine, not a model of it.

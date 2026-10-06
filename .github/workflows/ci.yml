@@ -53,3 +53,53 @@ jobs:
           cd /tmp
           /tmp/wheelenv/bin/survey-agent --version
           /tmp/wheelenv/bin/survey-agent selftest
+
+  install-matrix:
+    # Install the built wheel with each supported extras combination into its own clean venv OUTSIDE
+    # the checkout, then import + start each entry point. Catches an extra that silently depends on
+    # another one (e.g. the gateway needing python-multipart from [auth] when only [api] is installed).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel
+        run: |
+          pip install build
+          python -m build --wheel
+          echo "WHEEL=$(ls "$PWD"/dist/*.whl)" >> "$GITHUB_ENV"
+      - name: Base install (no extras)
+        run: |
+          python -m venv /tmp/ve-base && cd /tmp
+          /tmp/ve-base/bin/pip install "$WHEEL"
+          /tmp/ve-base/bin/survey-agent selftest
+          /tmp/ve-base/bin/python -c "import survey_agent.engine, survey_agent.server"
+      - name: "[api] install — gateway imports and serves in bearer-token mode"
+        run: |
+          python -m venv /tmp/ve-api && cd /tmp
+          /tmp/ve-api/bin/pip install "$WHEEL[api]"
+          /tmp/ve-api/bin/survey-agent selftest
+          /tmp/ve-api/bin/python -c "import survey_agent.api.app"
+          mkdir -p /tmp/sa-api && cd /tmp/sa-api
+          SURVEY_API_TOKEN=ci-token SURVEY_DEFINITION_SOURCE=file SURVEY_STORE=memory SURVEY_DIR=/tmp/sa-api \
+            /tmp/ve-api/bin/survey-agent api --port 8765 & pid=$!
+          for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8765/health && break; sleep 0.2; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/v1/surveys)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token' http://127.0.0.1:8765/v1/surveys)" = 200
+          kill $pid
+      - name: "[api,auth] install — gateway imports with Google sign-in configured"
+        run: |
+          python -m venv /tmp/ve-auth && cd /tmp
+          /tmp/ve-auth/bin/pip install "$WHEEL[api,auth]"
+          /tmp/ve-auth/bin/survey-agent selftest
+          /tmp/ve-auth/bin/python -c "import survey_agent.api.app"
+          SURVEY_GOOGLE_CLIENT_ID=ci SURVEY_GOOGLE_CLIENT_SECRET=ci \
+            SURVEY_SESSION_JWT_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')" \
+            /tmp/ve-auth/bin/python -c "import survey_agent.api.app as a; assert '/keys' in a.app.openapi()['paths']"
+      - name: "[mcp] install — MCP server imports"
+        run: |
+          python -m venv /tmp/ve-mcp && cd /tmp
+          /tmp/ve-mcp/bin/pip install "$WHEEL[mcp]"
+          /tmp/ve-mcp/bin/survey-agent selftest
+          /tmp/ve-mcp/bin/python -c "import survey_agent.mcp.server"

@@ -7,13 +7,23 @@ author-supplied text into something executable:
   warehouse query. Values are always bound parameters, but identifiers can't be, so they must
   match `IDENTIFIER_RE` (a plain unquoted identifier; `TABLE_RE` also allows `schema.table`).
 * **Regular expressions** — `regex_match` (logic) and `validation.regex` (question input) run an
-  author pattern against respondent-typed text. Patterns are capped at `MAX_PATTERN_LENGTH` and
-  rejected when they nest unbounded quantifiers (`(x+)+`, `(x*)*`, `(x+)*` …, the classic
-  catastrophic-backtracking shapes); the matched input is capped at `MAX_REGEX_INPUT` characters.
+  author pattern against respondent-typed text. The real bound is execution time: every match runs
+  on the `regex` engine with a hard `REGEX_TIMEOUT_SECONDS` timeout, so no accepted pattern can
+  monopolize the serving process; a match that times out counts as "refused". The validator also
+  rejects the shapes that backtrack catastrophically — nested unbounded quantifiers (`(x+)+`) and
+  alternation inside a repeated group (`(a|aa)+`) — patterns over `MAX_PATTERN_LENGTH` chars, and
+  the matched input is capped at `MAX_REGEX_INPUT` characters.
 
-Pure stdlib, no I/O — safe to import from the engine.
+No I/O — safe to import from the engine. (`regex` is a core dependency; if it's somehow missing we
+fall back to `re` with the static checks only.)
 """
+import functools
 import re
+
+try:
+    import regex as _regex
+except ImportError:  # pragma: no cover - `regex` is a declared dependency
+    _regex = None
 
 try:  # Python 3.11+
     import re._parser as _sre_parse  # type: ignore[import-not-found]
@@ -27,6 +37,7 @@ TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
 MAX_PATTERN_LENGTH = 200
 MAX_REGEX_INPUT = 2000
+REGEX_TIMEOUT_SECONDS = 0.05
 # A repeat whose upper bound exceeds this counts as "unbounded" for the nesting check.
 _LARGE_REPEAT = 50
 
@@ -74,12 +85,29 @@ def _children(av):
             yield from _children(x)
 
 
+def _branch_op():
+    consts = getattr(_sre_parse, "_constants", None) or _sre_parse
+    return getattr(consts, "BRANCH", None)
+
+
+def _has_branch(subpattern):
+    for op, av in subpattern:
+        if op == _branch_op():
+            return True
+        for child in _children(av):
+            if _has_branch(child):
+                return True
+    return False
+
+
 def _has_nested_unbounded(subpattern, inside_unbounded=False):
     for op, av in subpattern:
         if op in _repeat_ops():
             _lo, hi, body = av
             unbounded = hi == _MAXREPEAT or hi > _LARGE_REPEAT
             if unbounded and inside_unbounded:
+                return True
+            if unbounded and _has_branch(body):     # (a|aa)+ : overlapping alternatives, repeated
                 return True
             if _has_nested_unbounded(body, inside_unbounded or unbounded):
                 return True
@@ -101,13 +129,26 @@ def regex_problem(pattern):
     except re.error as e:
         return f"invalid regex: {e}"
     if _has_nested_unbounded(parsed):
-        return "regex nests unbounded quantifiers (e.g. (x+)+) — catastrophic backtracking risk"
+        return ("regex nests unbounded quantifiers or repeats an alternation (e.g. (x+)+ or (a|aa)+) — "
+                "catastrophic backtracking risk; use a character class or a bounded repeat instead")
     return None
 
 
+@functools.lru_cache(maxsize=512)
+def _compiled(pattern):
+    return (_regex or re).compile(pattern)
+
+
 def safe_search(pattern, text):
-    """re.search with the guards applied. Returns True/False, or None if the pattern is refused
-    (too long / catastrophic / invalid) — callers decide whether that fails open or closed."""
+    """Search with the guards applied. Returns True/False, or None if the pattern is refused (too
+    long / catastrophic shape / invalid) or the match exceeded REGEX_TIMEOUT_SECONDS — callers decide
+    whether that fails open or closed."""
     if regex_problem(pattern):
         return None
-    return re.search(pattern, str(text)[:MAX_REGEX_INPUT]) is not None
+    subject = str(text)[:MAX_REGEX_INPUT]
+    if _regex is None:  # pragma: no cover - static checks only
+        return re.search(pattern, subject) is not None
+    try:
+        return _compiled(pattern).search(subject, timeout=REGEX_TIMEOUT_SECONDS) is not None
+    except TimeoutError:
+        return None

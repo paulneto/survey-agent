@@ -5,11 +5,12 @@
 > and management loop** are the core and are tested. The **API gateway** (`survey-agent api`, the
 > `[api]` extra) serves definitions, lifecycle and read-side response access over HTTP; it **runs open
 > unless you configure auth** (see [The API gateway](#the-api-gateway--one-authenticated-front-door-to-the-data)).
-> **Erasure** is built in: `survey-agent dsar <uid> --delete` erases a subject's responses from the
-> configured store; copies you hold elsewhere (exports, backups, downstream systems) are yours to
-> clear. Terminal passbacks are **best-effort, fire-once** with an idempotency key; the optional
-> durable outbox (`SURVEY_OUTBOX=1`) covers mid-survey webhook **actions** only. For a local or
-> single-box deployment none of this bites; for a shared team deployment, plan for it.
+> **Erasure** is built in: `survey-agent dsar <id> --delete` erases a subject's responses, sessions,
+> uploaded files and queued webhook deliveries; copies outside the app (passbacks already sent,
+> exports, backups, logs, downstream systems) are yours to clear. Terminal passbacks are **best-effort, fire-once** with an
+> idempotency key; the optional durable outbox (`SURVEY_OUTBOX=1`) covers mid-survey webhook
+> **actions** only. For a local or single-box deployment none of this bites; for a shared team
+> deployment, plan for it.
 
 ## What does your deployment need? (start simple)
 
@@ -66,12 +67,16 @@ survey-agent has three deployment shapes; pick the smallest that fits:
 
 ## Host the try-in-browser demo (the agentic showcase)
 
-A public URL where anyone can take a survey as a **form** and as an **AI conversation** (`/chat`),
-with no install for the respondent:
+A public URL where anyone can take a survey as a **form** and try it as an **AI conversation**
+(`/chat`), with no install for the respondent:
 
 ```bash
-survey-agent serve --public
+SURVEY_CHAT_DEMO=1 survey-agent serve --public
 ```
+
+The browser chat is a demo surface: it is served only in demo/preview mode or with
+`SURVEY_CHAT_DEMO=1`, and it records nothing. Leave `SURVEY_CHAT_DEMO` unset on a runtime that
+fields real respondents.
 
 What `--public` does: binds `0.0.0.0` and serves only surveys whose
 lifecycle state is `live` (configurable with `SURVEY_SERVE_STATES`; anything pre-live shows a "not
@@ -88,10 +93,10 @@ web: survey-agent serve --public
 
 On a PaaS (Render, Railway, Koyeb, …): create a web service from your repo, build with
 `pip install ".[llm]"`, start with `survey-agent serve --public`. Add `ANTHROPIC_API_KEY` (or
-`OPENAI_API_KEY`) as a secret for natural conversational phrasing; with no key it runs on the
-deterministic offline stub. Front a specific survey with `SURVEY_FILE=surveys/<slug>.survey.json`.
-Conversation mode sends respondents' replies to that model provider — see
-[DATA_SECURITY.md](DATA_SECURITY.md#where-respondent-data-can-reach-an-llm).
+`OPENAI_API_KEY`) as a secret for natural conversational phrasing, and `SURVEY_CHAT_DEMO=1` to serve
+the `/chat` demo; with no key it runs on the deterministic offline stub. Front a specific survey with
+`SURVEY_FILE=surveys/<slug>.survey.json`. Conversation mode sends respondents' replies to that model
+provider — see [DATA_SECURITY.md](DATA_SECURITY.md#where-respondent-data-can-reach-an-llm).
 
 For a real multi-survey deployment (`serve --public --multi`, a durable store, auto-deploy), see
 [DEPLOY.md](DEPLOY.md).
@@ -178,8 +183,9 @@ Climb only as far as your deployment forces you:
 
 1. **`file`** (the default when `SURVEY_STORE` is unset) — flat JSON/JSONL under `./survey_data`
    (or `SURVEY_DATA_DIR`). Inspectable, grep-able, zero infra. Safe for a **single worker process** on
-   a **persistent disk**; not safe once more than one process writes.
-2. **`sqlite`** — one SQLite file with atomic quota increments that are safe across **threads and
+   a **persistent disk**. Quota reservations are file-locked, but sessions and responses aren't
+   locked across processes, so it isn't safe once more than one process writes.
+2. **`sqlite`** — one SQLite file with atomic quota reservation that is safe across **threads and
    processes** (WAL mode). Still pure stdlib, no server. The right step up when you run more than one
    worker on a single box. Path via `SURVEY_SQLITE_PATH`.
 3. **A database** — once storage is **shared across hosts** or the disk is **ephemeral**:
@@ -228,12 +234,25 @@ Things the runtime does so it behaves on a real host:
   webhook posts), `SURVEY_URL_SECRET` (signs/verifies respondent URLs), and the gateway's
   `SURVEY_SESSION_JWT_KEY` / `SURVEY_API_TOKEN`. Never ship the `.env.example` placeholders.
 - **TLS.** The runtime speaks plain HTTP; your host or proxy terminates HTTPS.
+- **Request limits.** Request bodies over `SURVEY_MAX_BODY_BYTES` (default 10 MB) get a 413 before
+  anything is read; the chat JSON endpoint is capped at 64 KB. Each connection has a socket timeout of
+  `SURVEY_REQUEST_TIMEOUT` seconds (default 30), so a stalled client can't hold a worker. File uploads
+  are checked against the question's count, extension and size rules before anything is stored.
+- **Response headers and logs.** Survey pages and data responses are sent with
+  `Cache-Control: no-store`, and every runtime response with `Referrer-Policy: no-referrer` and
+  `X-Content-Type-Options: nosniff`. Log lines carry a short hash in place of session and response
+  ids, and URLs reduced to scheme, host and path (no query string).
+- **What goes into the image.** `.dockerignore` excludes everything by default and re-includes only
+  what the image needs: `src/`, the packaging files, `surveys/*.survey.json`, `surveys/*.md`,
+  `surveys/.registry.json`, `surveys/.versions/` and `triggers/*.json`. Local data (`survey_data/`,
+  uploads, exports, `.env` files, databases) never reaches the build. If your runtime reads another
+  path, add it there.
 
 ## The API gateway — one authenticated front door to the data
 
 > **The gateway runs open — no authentication — unless you configure it.** Set at least a bearer
-> token (`SURVEY_API_TOKEN`), or use Google OAuth (the `[auth]` extra, `SURVEY_OAUTH_*`) or `sa_` API
-> keys. `survey-agent api` prints a warning when it starts without `SURVEY_API_TOKEN`.
+> token (`SURVEY_API_TOKEN`), or use `sa_` API keys or Google OAuth (the `[auth]` extra; see *Auth
+> modes* below). `survey-agent api` prints a warning when it starts without `SURVEY_API_TOKEN`.
 
 For a team deployment, don't give every process (the operator console, an MCP agent, the CLI) a
 direct database connection. Run the gateway where the database lives; it becomes the sole database
@@ -254,6 +273,28 @@ SURVEY_DEFINITION_SOURCE=http SURVEY_STORE=http \
   SURVEY_API_BASE=https://api.example.internal SURVEY_API_TOKEN=… survey-agent console
 ```
 
+**Auth modes.** `pip install 'survey-agent[api]'` runs the gateway in bearer-token mode
+(`SURVEY_API_TOKEN` and `sa_` API keys). Google sign-in needs
+`[api,auth]` and `SURVEY_GOOGLE_CLIENT_ID` / `SURVEY_GOOGLE_CLIENT_SECRET` (optionally
+`SURVEY_OAUTH_ALLOWED_DOMAIN`):
+
+- Session cookies are honoured only when Google sign-in is configured **and**
+  `SURVEY_SESSION_JWT_KEY` is a strong secret (not the dev default, at least 32 characters, e.g.
+  `python -c 'import secrets; print(secrets.token_urlsafe(48))'`). In every other mode cookies are
+  ignored. A session token must carry valid `exp`, `iat`, `aud` and `sub` claims.
+- With Google sign-in configured, the gateway refuses to start if the session key is weak or the
+  `[auth]` extra is missing (it prints the install hint).
+- The `/keys` page, where a signed-in person mints and revokes `sa_` keys, is served only when Google
+  sign-in is configured.
+
+**Lifecycle writes.** `POST /v1/registry/<id>` accepts only `status`, `note`, `project`, `live`,
+`live_version`, `validated` and `tested`; anything else is a 400. A write whose resulting state is
+`live`, and that newly makes the survey live or touches `status`, `live` or `live_version`, needs the
+launch approval (`X-Survey-Launch-Approval` header or an `approve` field) matching
+`SURVEY_LAUNCH_APPROVAL_TOKEN`. With no approval token configured, the gateway can't mark a survey
+live at all. A CLI pointed at the gateway (`SURVEY_DEFINITION_SOURCE=http`) forwards the approval it
+verified from `--approve`.
+
 The console still binds `127.0.0.1` by default and is itself unauthenticated; if you host it for a
 team (`--host 0.0.0.0`), put it behind your own auth proxy or VPN. The gateway does not provide
 organization/tenant scoping or an audit log of mutations — add those at your proxy if you need them.
@@ -273,8 +314,8 @@ endpoint speaking the MCP transport with **OAuth** in front. Use **Streamable HT
 - **No hosting needed** for desktop/CLI agents: register `survey-agent-mcp` as a local stdio MCP
   server (template: [`.mcp.json.example`](../.mcp.json.example)).
 
-Whatever the transport, the launch gate holds: the MCP connector cannot mark a survey live without
-`SURVEY_LAUNCH_APPROVAL_TOKEN`.
+Whatever the transport, the launch gate holds: neither the MCP connector nor the API gateway can mark
+a survey live without `SURVEY_LAUNCH_APPROVAL_TOKEN`.
 
 ## Quick start: the runtime on Cloud Run
 

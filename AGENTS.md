@@ -22,8 +22,8 @@ budget. The engine enforces this with an approval token:
   CLI (`launch`, `status --set live`, `publish`; pass `--approve <token>`), not the console, and not the
   MCP connector (pass `approval_token`). The token is something a human gives you; don't go looking
   for it.
-- When it is unset, the local CLI and console can mark a survey live, but the MCP connector still
-  cannot.
+- When it is unset, the local CLI and console can mark a survey live, but the MCP connector and the
+  API gateway still cannot.
 
 You always get the `survey_url`; only flipping the survey to *live* is gated.
 
@@ -81,7 +81,7 @@ survey-agent report  surveys/x.survey.json [--insights]
 survey-agent list                         # management view
 survey-agent status <id> [--set STATE]    # show or set one survey's lifecycle state
 survey-agent doctor                       # resolved install + config self-diagnosis
-survey-agent dsar <uid> [--delete]        # find/erase a subject's responses (DSAR)
+survey-agent dsar <id> [--delete]         # find/erase a subject's data: responses, sessions, uploads (DSAR)
 survey-agent backup / restore <file>      # portable JSONL cold backup of responses
 survey-agent outbox status|list|retry     # drain the durable webhook outbox (SURVEY_OUTBOX=1)
 ```
@@ -124,9 +124,11 @@ parsing results programmatically. The exit code is non-zero when a gate fails.
   validated.
 - **Conversation mode has limits.** `begin_survey` / `convo` handle choice, number and text questions;
   grids, rankings and file uploads aren't supported in conversation, so keep surveys meant for chat
-  to those types.
+  to those types. `convo` and the browser `/chat` are previews that record nothing; `begin_survey` /
+  `answer_survey` return the structured result to you.
 - **Definitions are immutable + versioned.** Editing publishes a new version; in-flight sessions stay
-  pinned to theirs.
+  pinned to theirs. With file definitions, commit `surveys/.versions/` (the version snapshots) along
+  with the survey.
 
 See [docs/ENGINEERING.md](docs/ENGINEERING.md) for the full architecture and
 [skills/author-survey/SKILL.md](skills/author-survey/SKILL.md) for the authoring playbook.

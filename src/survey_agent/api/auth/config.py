@@ -21,7 +21,8 @@ GOOGLE_CLIENT_SECRET = os.environ.get("SURVEY_GOOGLE_CLIENT_SECRET", "")
 ALLOWED_DOMAIN = os.environ.get("SURVEY_OAUTH_ALLOWED_DOMAIN", "")
 
 # Signed-session key for OAuth'd users (JWT cookie + the Authlib redirect session). Must be set to a
-# real secret in any deployment that turns OAuth on; the dev placeholder is rejected at startup then.
+# real secret (>= MIN_SESSION_KEY_LEN chars) in any deployment that turns OAuth on; a weak/placeholder
+# key is rejected at startup then. Without OAuth, session cookies are never honoured at all.
 SESSION_JWT_KEY = os.environ.get("SURVEY_SESSION_JWT_KEY", DEV_SESSION_KEY)
 
 # Server-to-server provisioning key (the trust boundary for /provision/cli-token). A trusted upstream
@@ -35,6 +36,24 @@ PUBLIC_BASE_URL = os.environ.get("SURVEY_PUBLIC_BASE_URL", "http://localhost:800
 OAUTH_REDIRECT_PATH = "/auth/google/callback"
 
 
+# A session key shorter than this is treated as weak (HS256 wants >= 256 bits of key material).
+MIN_SESSION_KEY_LEN = 32
+
+
 def oauth_configured() -> bool:
     """OAuth is live only when a GCP client id + secret are both present."""
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+
+
+def session_key_strong(key=None) -> bool:
+    """True when the session signing key is a real secret: set, not the public dev placeholder, and
+    at least MIN_SESSION_KEY_LEN characters long."""
+    key = SESSION_JWT_KEY if key is None else key
+    return bool(key) and key != DEV_SESSION_KEY and len(key) >= MIN_SESSION_KEY_LEN
+
+
+def session_auth_enabled() -> bool:
+    """Session cookies are honoured ONLY when Google sign-in is configured AND the session key is
+    strong. In every other mode (bearer-token only, API-key only, open dev) cookies are ignored
+    entirely — otherwise anyone could forge one with the public dev key."""
+    return oauth_configured() and session_key_strong()

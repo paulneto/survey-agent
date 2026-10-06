@@ -58,6 +58,11 @@ def _get(url):
         return e.code, e.read().decode()
 
 
+def _tok(html):
+    """The opaque per-session submit token rendered as a hidden field (R3)."""
+    return re.search(r'name=session_token value="([^"]+)"', html).group(1)
+
+
 def _post(url, data):
     req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(), method="POST")
     with urllib.request.urlopen(req) as r:
@@ -87,7 +92,7 @@ def test_post_advances_to_terminal():
         sid = re.search(r'name=session_id value="([^"]+)"', html).group(1)
         pid = re.search(r'name=page_id value="([^"]+)"', html).group(1)
         status, done = _post(f"{base}/s/t_http/submit",
-                             {"session_id": sid, "page_id": pid, "q_consent": "yes"})
+                             {"session_id": sid, "session_token": _tok(html), "page_id": pid, "q_consent": "yes"})
         assert status == 200
         assert "Complete" in done                             # render_terminal header for a completion
 
@@ -134,7 +139,7 @@ def test_last_page_button_says_submit_others_continue():
         assert "<button>Continue →</button>" in h1            # an intermediate page advances
         sid = re.search(r'name=session_id value="([^"]+)"', h1).group(1)
         pid = re.search(r'name=page_id value="([^"]+)"', h1).group(1)
-        _, h2 = _post(f"{base}/s/t_http2/submit", {"session_id": sid, "page_id": pid, "q1": "a"})
+        _, h2 = _post(f"{base}/s/t_http2/submit", {"session_id": sid, "session_token": _tok(h1), "page_id": pid, "q1": "a"})
         assert "<button>Submit</button>" in h2                # the last page submits
 
 
@@ -144,7 +149,8 @@ def test_terminal_is_a_clean_thank_you():
         _, h = _get(f"{base}/s/t_http?uid=10&rid=20&group=demo")
         sid = re.search(r'name=session_id value="([^"]+)"', h).group(1)
         pid = re.search(r'name=page_id value="([^"]+)"', h).group(1)
-        _, done = _post(f"{base}/s/t_http/submit", {"session_id": sid, "page_id": pid, "q_consent": "yes"})
+        _, done = _post(f"{base}/s/t_http/submit", {"session_id": sid, "session_token": _tok(h),
+                                                     "page_id": pid, "q_consent": "yes"})
         assert "Complete" in done
         assert "start again" not in done
         assert "passback was sent" not in done
@@ -232,7 +238,7 @@ def test_preview_token_bypasses_the_gate_but_collects_nothing():
         sid = re.search(r'name=session_id value="([^"]+)"', ok).group(1)
         pid = re.search(r'name=page_id value="([^"]+)"', ok).group(1)
         status, done = _post(f"{base}/s/t_http/submit",
-                             {"session_id": sid, "page_id": pid, "q_consent": "yes"})
+                             {"session_id": sid, "session_token": _tok(ok), "page_id": pid, "q_consent": "yes"})
         assert status == 200 and "Complete" in done             # preview reaches the terminal page
         assert server.STORE.list_responses("t_http") == []      # …but collected no data
 

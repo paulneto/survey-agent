@@ -60,7 +60,7 @@ def test_file_get_put_and_registry(tmp_path):
     reg = d.get_registry("s1")
     assert reg["status"] == "live" and reg["live_version"] == 1
     assert [e["id"] for e in d.list_surveys()] == ["s1"]
-    assert d.iter_versions("s1") == [(1, None, None)]
+    assert [v for v, _, _ in d.iter_versions("s1")] == [1]
 
 
 # ---- mongo backend (fake collections) ----

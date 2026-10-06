@@ -18,9 +18,14 @@ Interface (both backends implement):
   put(survey_id, response_id, question_id, filename, data, content_type=None) -> ref dict
   open(ref) -> bytes
   url(ref) -> str | None        # a (possibly presigned/served) URL, when the backend can produce one
+  delete(ref) -> bool           # remove the bytes (erasure / a rejected or superseded upload)
+
+Keys are unique per upload (a random component), so a retake or a re-upload under the same response
+never overwrites earlier bytes — every stored ref keeps pointing at exactly what was uploaded.
 """
 import os
 import re
+import secrets
 
 BUILTINS = ("local", "s3")
 
@@ -34,7 +39,18 @@ def _safe_name(filename):
 
 def _key(survey_id, response_id, question_id, filename):
     parts = [re.sub(r"[^A-Za-z0-9._-]+", "_", str(p)) for p in (survey_id, response_id, question_id)]
-    return "/".join(parts) + "/" + _safe_name(filename)
+    # random component: two uploads with the same name under one response never collide/overwrite
+    return "/".join(parts) + "/" + secrets.token_hex(8) + "_" + _safe_name(filename)
+
+
+def _check_key(key):
+    """A stored key is relative and never climbs out of the store root (refs come back from stored
+    records, so treat them as untrusted when turning them into paths)."""
+    key = str(key or "")
+    norm = os.path.normpath(key)
+    if not key or os.path.isabs(key) or norm.startswith("..") or "\0" in key:
+        raise ValueError("invalid upload key")
+    return norm
 
 
 class LocalUploadStore:
@@ -55,11 +71,28 @@ class LocalUploadStore:
         return ref
 
     def open(self, ref):
-        with open(os.path.join(self.root, ref["key"]), "rb") as f:
+        with open(os.path.join(self.root, _check_key(ref["key"])), "rb") as f:
             return f.read()
 
     def url(self, ref):
         return ref.get("url")
+
+    def delete(self, ref):
+        """Remove the bytes for `ref`. Idempotent: True if something was removed, False if absent."""
+        path = os.path.join(self.root, _check_key((ref or {}).get("key")))
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            return False
+        # tidy now-empty per-question/per-response directories (never above root)
+        d, root = os.path.dirname(path), os.path.abspath(self.root)
+        while os.path.abspath(d).startswith(root + os.sep):
+            try:
+                os.rmdir(d)
+            except OSError:
+                break
+            d = os.path.dirname(d)
+        return True
 
 
 class S3UploadStore:
@@ -97,6 +130,12 @@ class S3UploadStore:
             Params={"Bucket": ref.get("bucket", self.bucket), "Key": self._full_key(ref["key"])},
             ExpiresIn=expires,
         )
+
+    def delete(self, ref):
+        """Remove the object for `ref` (S3 DeleteObject is idempotent). Returns True."""
+        self.client.delete_object(Bucket=(ref or {}).get("bucket", self.bucket),
+                                  Key=self._full_key(_check_key((ref or {}).get("key"))))
+        return True
 
 
 def _load_custom(path, **kwargs):

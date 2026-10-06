@@ -8,13 +8,26 @@ Collections:
   sessions        unique index (survey_id, rid, uid); also index session_id, url_variables.uid
   quota_counters  unique index (survey_id, version, quota_id); $inc is atomic
   responses       append-only export records; index (survey_id, url_variables.uid)
+
+`client=` injects an already-built client (e.g. mongomock in tests) instead of connecting to `uri`.
 """
+from . import (erasure_result, norm_id_fields, response_matches,
+               session_matches)
+
+
+def _safe_field(f):
+    """A url-var name usable in a dotted Mongo path (no '.', no leading '$')."""
+    return "." not in f and not f.startswith("$")
 
 
 class MongoStore:
-    def __init__(self, uri="mongodb://localhost:27017", db="survey_agent"):
-        from pymongo import MongoClient, ASCENDING
-        self._client = MongoClient(uri)
+    def __init__(self, uri="mongodb://localhost:27017", db="survey_agent", client=None):
+        from pymongo import ASCENDING
+        if client is None:
+            from pymongo import MongoClient
+            client = MongoClient(uri)
+        self._client = client
+        self._txn_ok = None          # unknown until the first reserve_quotas (standalone → False)
         self.db = self._client[db]
         self.sessions = self.db.sessions
         self.quota_counters = self.db.quota_counters
@@ -67,28 +80,153 @@ class MongoStore:
         )
         return (doc or {}).get("count", 1)
 
+    # ---- all-or-nothing quota reservation ----
+    def reserve_quotas(self, survey_id, version, limits):
+        """Increment every bucket in `limits` iff each limited one is below its limit; all-or-nothing.
+
+        With a replica set / mongos, one multi-document transaction does the conditional increments
+        (a write conflict aborts + retries, so two reservers can't both take the last slot). On a
+        standalone server (no transactions) it falls back to sequential conditional `$inc`s
+        (`count < limit` in the filter) and compensates (`$inc: -1`) any already taken when a later
+        one fails — never over-fills; in the brief compensation window a concurrent reserver may
+        see an inflated count and be refused (a safe false "full")."""
+        if not limits:
+            return True
+        self._ensure_counters(survey_id, version, list(limits))
+        if self._txn_ok is not False:
+            try:
+                return self._reserve_txn(survey_id, version, limits)
+            except NotImplementedError:                    # e.g. mongomock: no sessions
+                self._txn_ok = False
+            except Exception as e:                         # standalone mongod: IllegalOperation (20)
+                if getattr(e, "code", None) == 20 or "Transaction numbers" in str(e) \
+                        or "replica set" in str(e):
+                    self._txn_ok = False
+                else:
+                    raise
+        return self._reserve_sequential(survey_id, version, limits)
+
+    def _ensure_counters(self, survey_id, version, qids):
+        """Create missing counters at 0 (outside any transaction), so the conditional increments never
+        need an upsert — an upsert against a full counter would collide with the unique index."""
+        from pymongo.errors import DuplicateKeyError
+        for qid in qids:
+            try:
+                self.quota_counters.update_one(
+                    {"survey_id": survey_id, "version": version, "quota_id": qid},
+                    {"$setOnInsert": {"count": 0}}, upsert=True)
+            except DuplicateKeyError:                      # a concurrent creator won — fine
+                pass
+
+    def _cond_inc(self, survey_id, version, qid, limit, session=None):
+        """+1 one (existing) counter, only if below `limit` (unconditional when None). True if done."""
+        if limit is not None and limit <= 0:
+            return False
+        filt = {"survey_id": survey_id, "version": version, "quota_id": qid}
+        if limit is not None:
+            filt["count"] = {"$lt": limit}
+        res = self.quota_counters.update_one(filt, {"$inc": {"count": 1}}, session=session)
+        return res.modified_count == 1
+
+    def _reserve_txn(self, survey_id, version, limits):
+        outcome = {}
+
+        def body(session):
+            outcome["ok"] = False
+            for qid, lim in limits.items():
+                if not self._cond_inc(survey_id, version, qid, lim, session=session):
+                    session.abort_transaction()
+                    return
+            outcome["ok"] = True
+
+        with self._client.start_session() as session:
+            session.with_transaction(body)
+        self._txn_ok = True
+        return outcome["ok"]
+
+    def _reserve_sequential(self, survey_id, version, limits):
+        taken = []
+        for qid, lim in limits.items():
+            if self._cond_inc(survey_id, version, qid, lim):
+                taken.append(qid)
+                continue
+            for t in taken:                                # compensate: no partial reservation
+                self.quota_counters.update_one(
+                    {"survey_id": survey_id, "version": version, "quota_id": t}, {"$inc": {"count": -1}})
+            return False
+        return True
+
+    # ---- responses ----
     def record_response(self, survey_id, response):
         self.responses.insert_one({"survey_id": survey_id, **response})
 
-    def list_responses(self, survey_id=None, uid=None):
+    @staticmethod
+    def _id_query(prefix, respondent_id, fields):
+        vals = list({str(respondent_id), respondent_id}) if not isinstance(respondent_id, str) \
+            else [respondent_id]
+        if not all(_safe_field(f) for f in fields):
+            return None                                    # odd var name → scan, filter in Python
+        return {"$or": [{f"{prefix}.{f}": {"$in": vals}} for f in fields]}
+
+    def list_responses(self, survey_id=None, uid=None, id_fields=None):
+        fields = norm_id_fields(id_fields)
         q = {}
         if survey_id is not None:
             q["survey_id"] = survey_id
         if uid is not None:
-            q["url_variables.uid"] = str(uid)
+            if fields == ("uid",):
+                q["url_variables.uid"] = str(uid)
+            else:
+                iq = self._id_query("url_variables", uid, fields)
+                if iq:
+                    q.update(iq)
         out = []
         for d in self.responses.find(q):
             d.pop("_id", None)
-            out.append(d)
+            if uid is None or fields == ("uid",) or response_matches(d, uid, fields):
+                out.append(d)
         return out
 
-    def delete_responses(self, uid=None, survey_id=None):
-        """Erasure hook (DSAR): delete responses matching uid and/or survey_id. Returns count removed."""
-        q = {}
-        if uid is not None:
-            q["url_variables.uid"] = str(uid)
+    def _find(self, coll, prefix, respondent_id, fields, survey_id, match):
+        q = self._id_query(prefix, respondent_id, fields) or {}
         if survey_id is not None:
             q["survey_id"] = survey_id
+        out = []
+        for d in coll.find(q):
+            if match(d, respondent_id, fields):
+                out.append(d)
+        return out
+
+    def find_respondent(self, respondent_id, id_fields=("uid",), survey_id=None):
+        fields = norm_id_fields(id_fields)
+        resp = self._find(self.responses, "url_variables", respondent_id, fields, survey_id,
+                          response_matches)
+        sess = self._find(self.sessions, "url_vars", respondent_id, fields, survey_id, session_matches)
+        for d in resp + sess:
+            d.pop("_id", None)
+        return {"responses": resp, "sessions": sess}
+
+    def erase_respondent(self, respondent_id, id_fields=("uid",), survey_id=None):
+        """DSAR erasure: delete every matching response AND session (partial sessions, retakes, every
+        survey). Returns counts + the upload refs / webhook keys found in what was deleted."""
+        fields = norm_id_fields(id_fields)
+        resp = self._find(self.responses, "url_variables", respondent_id, fields, survey_id,
+                          response_matches)
+        sess = self._find(self.sessions, "url_vars", respondent_id, fields, survey_id, session_matches)
+        if resp:
+            self.responses.delete_many({"_id": {"$in": [d["_id"] for d in resp]}})
+        if sess:
+            self.sessions.delete_many({"_id": {"$in": [d["_id"] for d in sess]}})
+        for d in resp + sess:
+            d.pop("_id", None)
+        return erasure_result(resp, sess)
+
+    def delete_responses(self, uid=None, survey_id=None):
+        """Compat wrapper. With a uid this is a full respondent erasure (responses AND sessions, matched
+        on url var `uid`); with only survey_id it drops that survey's responses. Returns responses removed."""
+        if uid is not None:
+            return self.erase_respondent(uid, ("uid",), survey_id)["responses"]
+        q = {} if survey_id is None else {"survey_id": survey_id}
         return self.responses.delete_many(q).deleted_count
 
     def ping(self):

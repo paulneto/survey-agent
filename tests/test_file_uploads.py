@@ -106,10 +106,13 @@ class _FakeS3:
 def test_s3_upload_roundtrip_and_presigned_url():
     us = S3UploadStore(bucket="b", client=_FakeS3())
     ref = us.put("surv", "resp", "q_zip", "insta.zip", b"zipbytes", content_type="application/zip")
-    assert ref == {"backend": "s3", "bucket": "b", "key": "surv/resp/q_zip/insta.zip",
+    key = ref.pop("key")
+    assert ref == {"backend": "s3", "bucket": "b",
                    "filename": "insta.zip", "size": 8, "content_type": "application/zip"}
+    assert key.startswith("surv/resp/q_zip/") and key.endswith("_insta.zip")   # unique per upload
+    ref["key"] = key
     assert us.open(ref) == b"zipbytes"
-    assert us.url(ref).startswith("https://s3.example/b/surv/resp/q_zip/insta.zip")
+    assert us.url(ref).startswith(f"https://s3.example/b/{key}")
 
 
 def test_s3_requires_bucket(monkeypatch):

@@ -10,7 +10,8 @@ Usage:
     session = rt.new_session(session_id, url_vars)
     step = rt.start(session, quota_state)      # -> {"page": ...} | {"terminal": ...}
     step = rt.submit(session, page_id, answers, quota_state)
-    # on a 'complete' terminal: caller increments rt.quota_buckets(session) and fires callback
+    # on a 'complete' terminal: caller atomically reserves rt.quota_buckets(session) (else
+    # rt.overquota_terminal(session)) and fires callback
 """
 import hashlib
 import re
@@ -154,7 +155,20 @@ class SurveyRuntime:
             "reason_code": None,
             "render_state": {},
             "enrichments": {},   # behavioral facts (Firebolt/cache), resolved once at session start
+            # which captured url vars may leave the system in started/terminal passback events: the
+            # survey's declared settings.url_variables + the identity vars. Everything the link
+            # carried is still captured in url_vars (the drop-in contract); this only scopes egress.
+            "passback_vars": self.passback_vars(),
         }
+
+    def passback_vars(self):
+        """Declared url variables (settings.url_variables) plus the identity vars, in order, deduped —
+        the allowlist of captured params forwarded to integrations (see engine/terminal.build_event)."""
+        out = []
+        for v in list(self.settings.get("url_variables") or []) + [self.respondent_var, self.response_var]:
+            if isinstance(v, str) and v and v not in out:
+                out.append(v)
+        return out
 
     def _ctx(self, session, quota_state=None, loop=None):
         return EvalContext(
@@ -571,26 +585,48 @@ class SurveyRuntime:
                     errors[qid] = "Please answer every row."
             elif q["type"] == "file":
                 # The answer is an upload *reference* (filename/size/key/url) — the engine never
-                # sees the bytes (the web layer stored them via store/uploads before submit). We
-                # validate the metadata only: extension allow-list + per-file size cap.
-                refs = val if isinstance(val, list) else [val]
-                exts = [e.lower().lstrip(".") for e in (v.get("extensions") or [])]
-                max_kb = v.get("max_size_kb")
-                max_files = v.get("max_files", 1)
-                if len(refs) > max_files:
-                    errors[qid] = f"Please upload at most {max_files} file(s)."
-                    continue
-                for ref in refs:
-                    name = (ref or {}).get("filename", "") if isinstance(ref, dict) else ""
-                    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-                    if exts and ext not in exts:
-                        errors[qid] = f"File type .{ext or '?'} not allowed (allowed: {', '.join(exts)})."
-                        break
-                    size = (ref or {}).get("size") if isinstance(ref, dict) else None
-                    if max_kb and isinstance(size, (int, float)) and size > max_kb * 1024:
-                        errors[qid] = f"File is too large (max {max_kb} KB)."
-                        break
+                # sees the bytes. The web layer pre-validates the same metadata with
+                # file_upload_error() BEFORE storing anything, then stores and submits the refs.
+                err = self.file_upload_error(q, val)
+                if err:
+                    errors[qid] = err
         return errors
+
+    @staticmethod
+    def file_upload_error(q, val):
+        """Validate a `file` answer's metadata (a ref dict, or a list of them — only `filename` and
+        `size` are read): count cap, extension allow-list, per-file size cap. Returns an error message
+        or None. Pure — callers can run it on {filename, size} stubs before persisting any bytes."""
+        v = q.get("validation") or {}
+        refs = val if isinstance(val, list) else [val]
+        exts = [e.lower().lstrip(".") for e in (v.get("extensions") or [])]
+        max_kb = v.get("max_size_kb")
+        max_files = v.get("max_files", 1)
+        if len(refs) > max_files:
+            return f"Please upload at most {max_files} file(s)."
+        for ref in refs:
+            name = (ref or {}).get("filename", "") if isinstance(ref, dict) else ""
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if exts and ext not in exts:
+                return f"File type .{ext or '?'} not allowed (allowed: {', '.join(exts)})."
+            size = (ref or {}).get("size") if isinstance(ref, dict) else None
+            if max_kb and isinstance(size, (int, float)) and size > max_kb * 1024:
+                return f"File is too large (max {max_kb} KB)."
+        return None
+
+    def file_questions_for_submit(self, session, page_id, quota_state=None):
+        """{answer_key: question} for the `file` question instances displayed on the page the
+        respondent is currently on — or {} when `page_id` is stale/unknown (submit() would just
+        re-render). The web layer stores uploaded bytes only for these keys, so a forged or stale
+        multipart POST can't park blobs against questions that aren't on screen."""
+        base_id, item = repeat.split_instance(page_id or "")
+        if base_id not in self.page_index or self.page_index[base_id] != session.get("page_pointer"):
+            return {}
+        page = self.pages[self.page_index[base_id]]
+        loop = self._loop(page, session)
+        if (loop["value"] if loop else None) != item:
+            return {}
+        return {key: q for key, q, _ in self._instances(page, session, quota_state) if q["type"] == "file"}
 
     # ----------------------------------------------------------- internals
     def _coerce(self, q, val):
@@ -719,10 +755,18 @@ class SurveyRuntime:
             }
         raise ValueError(f"non-terminal action: {t!r}")
 
+    def overquota_terminal(self, session):
+        """Turn this session into an over-quota terminal using the survey's own overquota action
+        (its message/redirect), else a default one. Used by the caller when a `complete` loses the
+        race for the last quota slot (the atomic reservation failed)."""
+        action = next((a for a in self.actions if a.get("type") == "overquota"), None) or {"type": "overquota"}
+        return self._terminal(session, {**action, "type": "overquota"})
+
     # ----------------------------------------------------------- quotas
     def quota_buckets(self, session):
-        """Quota ids this session's answers fall into. The caller atomically increments
-        these on a *complete* terminal (survey-scope quotas always apply)."""
+        """Quota ids this session's answers fall into. On a *complete* terminal the caller atomically
+        reserves all of these (all-or-nothing, against their limits) before accepting the completion
+        (survey-scope quotas always apply)."""
         ctx = self._ctx(session)
         hit = []
         for qd in self.d.get("quotas", []):

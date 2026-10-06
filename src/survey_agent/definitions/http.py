@@ -53,7 +53,10 @@ class HTTPDefinitionStore(DefinitionStore):
         # (config.may_mark_live records it after checking `--approve` locally).
         from survey_agent.config import approved_launch_token
         tok = approved_launch_token()
-        extra = {"X-Survey-Launch-Approval": tok} if tok and fields.get("status") == "live" else None
+        # The gateway gates any lifecycle write that touches status / live / live_version (anything that can
+        # make or keep a survey live), so forward the approval whenever one of those is in the write.
+        gated = any(k in fields for k in ("status", "live", "live_version"))
+        extra = {"X-Survey-Launch-Approval": tok} if tok and gated else None
         return self._req("POST", f"/v1/registry/{self._q(survey_id)}", body=fields, extra_headers=extra)
 
     def list_surveys(self):

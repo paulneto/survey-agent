@@ -29,8 +29,27 @@ Store interface (all backends implement):
   quota_counts(survey_id, version) -> {quota_id: int}
   incr_quota(survey_id, version, quota_id) -> int           # new count (atomic per backend)
   record_response(survey_id, response)                      # append-only export record
-  list_responses(survey_id=None, uid=None) -> [response]
+  list_responses(survey_id=None, uid=None, id_fields=None) -> [response]
+  reserve_quotas(survey_id, version, limits) -> bool         # all-or-nothing capacity reservation
+  find_respondent(respondent_id, id_fields=("uid",), survey_id=None) -> {responses, sessions}
+  erase_respondent(respondent_id, id_fields=("uid",), survey_id=None)
+      -> {responses: n, sessions: m, upload_refs: [ref], webhook_keys: [key]}
+  delete_responses(uid=None, survey_id=None) -> n            # compat wrapper over erase_respondent
+
+Quota reservation: `limits` is {quota_id: limit_or_None}. The store increments EVERY listed counter
+iff each limited counter is currently below its limit — atomically, all-or-nothing (no partial
+increments). Returns True when reserved, False when any limited bucket is full. `incr_quota` stays as
+the unconditional single-counter primitive.
+
+Respondent erasure (DSAR): a respondent is matched by value against any of `id_fields` — the url
+variable names that carry a person's id (`uid` by default; surveys can rename it with
+`settings.identity.respondent` and a deployment with SURVEY_RESPONDENT_VAR, so callers pass the union).
+Responses match on `url_variables[f]`, sessions on `url_vars[f]` — every survey, partial sessions and
+retakes included. The store deletes what it holds and *returns* the upload refs (blob references found
+in the deleted answers) and webhook idempotency keys (for clearing queued deliveries); deleting the
+blobs and queue items is the caller's job, since those live in other seams.
 """
+import hashlib
 import os
 
 BUILTINS = ("memory", "file", "sqlite", "mongo", "http")
@@ -73,3 +92,90 @@ def get_store(kind=None, **kwargs):
     raise ValueError(
         f"unknown SURVEY_STORE: {kind!r}. Use a built-in ({'|'.join(BUILTINS)}) or an import "
         f"path to your own store, e.g. 'my_pkg.store:PostgresStore'.")
+
+
+# ---- shared helpers for the respondent-erasure contract (used by every built-in store) ----
+
+def norm_id_fields(id_fields):
+    """A de-duplicated tuple of identity url-var names (default ("uid",))."""
+    if id_fields is None:
+        return ("uid",)
+    if isinstance(id_fields, str):
+        id_fields = (id_fields,)
+    out = []
+    for f in id_fields:
+        if f and str(f) not in out:
+            out.append(str(f))
+    return tuple(out) or ("uid",)
+
+
+def respondent_matches(url_vars, respondent_id, id_fields):
+    """True if any of `id_fields` in this url-var mapping equals `respondent_id` (compared as str)."""
+    uv = url_vars or {}
+    rid = str(respondent_id)
+    return any(uv.get(f) is not None and str(uv.get(f)) == rid for f in id_fields)
+
+
+def response_matches(response, respondent_id, id_fields):
+    return respondent_matches(response.get("url_variables"), respondent_id, id_fields)
+
+
+def session_matches(session, respondent_id, id_fields):
+    return respondent_matches(session.get("url_vars"), respondent_id, id_fields)
+
+
+def upload_refs_in(obj, out=None):
+    """Every upload reference ({backend, key, ...}, see store/uploads.py) nested anywhere in `obj`."""
+    out = [] if out is None else out
+    if isinstance(obj, dict):
+        if isinstance(obj.get("key"), str) and isinstance(obj.get("backend"), str):
+            out.append(obj)
+        else:
+            for v in obj.values():
+                upload_refs_in(v, out)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            upload_refs_in(v, out)
+    return out
+
+
+def record_upload_refs(record):
+    """Upload refs in a session (`answers`) or a response (`survey_data`)."""
+    return upload_refs_in([record.get("answers"), record.get("survey_data")])
+
+
+def session_webhook_keys(session):
+    """Idempotency keys of the webhook actions this session fired — the same derivation as
+    engine.runtime.SurveyRuntime._collect_webhooks (sha256 of "<session_id>|webhook:<index>"), so a
+    caller can find any queued (outbox) delivery that carries this respondent's data."""
+    sid = session.get("session_id")
+    if not sid:
+        return []
+    return [hashlib.sha256(f"{sid}|webhook:{i}".encode()).hexdigest()
+            for i in (session.get("fired_webhooks") or [])]
+
+
+def erasure_result(responses, sessions):
+    """Build the erase_respondent() return value from the deleted response + session records."""
+    refs, seen = [], set()
+    for rec in list(responses) + list(sessions):
+        for ref in record_upload_refs(rec):
+            k = (ref.get("backend"), ref.get("key"))
+            if k not in seen:
+                seen.add(k)
+                refs.append(ref)
+    keys = []
+    for s in sessions:
+        for k in session_webhook_keys(s):
+            if k not in keys:
+                keys.append(k)
+    return {"responses": len(responses), "sessions": len(sessions), "upload_refs": refs,
+            "webhook_keys": keys}
+
+
+def check_reservation(counts, limits):
+    """True iff every limited bucket in `limits` is below its limit given current `counts`."""
+    for qid, lim in (limits or {}).items():
+        if lim is not None and counts.get(qid, 0) >= lim:
+            return False
+    return True

@@ -28,7 +28,7 @@
     survey-agent templates · new <tpl> --slug S     list templates · scaffold a survey from one
     survey-agent copy <id|file> --slug S · templatize <id|file>   duplicate a survey · promote it to a template
     survey-agent backup · restore <file>            response backup to JSONL · idempotent reload
-    survey-agent dsar <uid> [--delete]              find / erase one subject's responses
+    survey-agent dsar <uid> [--delete]              find / erase one subject's data
     survey-agent outbox status|list|retry           the durable webhook outbox
     survey-agent api [--host H] [--port P]          the authenticated API gateway ([api] extra)
     survey-agent docs [name] · selftest              documentation map · prove the install works
@@ -222,6 +222,23 @@ def _cmd_schema(a):
 
 def _survey_id(spec):
     return ((spec.get("survey", spec) if isinstance(spec, dict) else {}) or {}).get("id")
+
+
+def _snapshot_launched(survey_path, sid):
+    """With file definitions, write the immutable snapshot of the version being launched NOW, next to the
+    survey (surveys/.versions/), so it is committed and deployed with it. Otherwise the snapshot would
+    only be created on the serving host — lost on a redeploy to ephemeral disk, stranding respondents
+    who started on this version. Best-effort; prints what to commit."""
+    try:
+        from survey_agent.definitions.file import FileDefinitionStore
+        sdir = os.path.dirname(os.path.abspath(survey_path))
+        spec = FileDefinitionStore(sdir).get_definition(sid)
+        ver = ((spec or {}).get("survey") or {}).get("version")
+        if ver is not None and os.path.isdir(os.path.join(sdir, ".versions", sid)):
+            print(f"   Snapshot of v{ver} saved under {os.path.relpath(os.path.join(sdir, '.versions', sid))}/ "
+                  f"— commit it with the survey so in-flight respondents stay pinned across deploys.")
+    except Exception:
+        pass
 
 
 def _record(survey_path, fn, *args):
@@ -553,6 +570,7 @@ def _cmd_launch(a):
             return 0
         _record(a.survey, lambda r, sdir: r.set_status(sid, status="live", url=url, sdir=sdir))
         print(f"\nMarked '{sid}' live in the registry (survey-agent status {sid} / list).")
+        _snapshot_launched(a.survey, sid)
         # Marking live is local bookkeeping — it does NOT publish. Either run the configured deploy
         # hook now (--deploy) or make the gap impossible to miss.
         if a.deploy:
@@ -1542,58 +1560,183 @@ def _cmd_outbox(a):
     return 0
 
 
-def _cmd_dsar(a):
-    """Find — and with --delete, erase — a data subject's responses by uid across the configured
-    store (SURVEY_STORE). The built-in erasure path for a DSAR / right-to-be-forgotten request.
+def _dsar_id_fields(extra=()):
+    """Every url-var name that can carry a respondent's id in this deployment: the generic `uid`, the
+    runtime-wide default (SURVEY_RESPONDENT_VAR), any `--id-field`, and every survey's
+    `settings.identity.respondent` across every version in the definition store. Returns
+    (fields, warnings) — a definition store we can't read is a warning, not a silent miss."""
+    from survey_agent.engine import runtime as _rt
+    fields, warnings = ["uid"], []
 
-    The engine locates the records; deletion is real (file/sqlite/mongo/memory all implement it).
-    Erasure of any *copies you hold* — exports, backups, downstream warehouses — is still yours."""
+    def add(f):
+        if f and str(f) not in fields:
+            fields.append(str(f))
+    add(_rt.DEFAULT_RESPONDENT_VAR)
+    for f in extra or ():
+        add(f)
+    try:
+        from survey_agent import definitions
+        ds = definitions.get_definition_store()
+        if hasattr(ds, "snapshot_on_read"):          # file backend: inspect only, never write snapshots
+            ds.snapshot_on_read = False
+        for e in ds.list_surveys():
+            sid = e.get("id")
+            if not sid or e.get("missing_file"):
+                continue
+            specs = [ds.get_definition(sid)]
+            try:
+                specs += [ds.get_definition(sid, v) for v, _, _ in (ds.iter_versions(sid) or [])]
+            except Exception:
+                pass
+            for spec in specs:
+                ident = (((spec or {}).get("survey", spec or {}) or {}).get("settings") or {}).get("identity") or {}
+                add(ident.get("respondent"))
+    except Exception as e:  # noqa: BLE001 — report, don't abort: the defaults still apply
+        warnings.append(f"could not read the definition store to find custom identity vars ({e}); "
+                        f"matched only on {', '.join(fields)} — add more with --id-field")
+    return fields, warnings
+
+
+def _dsar_delete_uploads(refs):
+    """Delete upload blobs by ref via the upload store's delete(). Returns (deleted, errors)."""
+    from survey_agent.store import uploads as uploads_mod
+    deleted, errors = 0, []
+    for ref in refs:
+        try:
+            kind = ref.get("backend")
+            store = uploads_mod.get_upload_store(kind if kind in uploads_mod.BUILTINS else None)
+            deleter = getattr(store, "delete", None)
+            if deleter is None:
+                errors.append(f"{kind}:{ref.get('key')}: the upload store has no delete() — remove it by hand")
+                continue
+            deleter(ref)
+            deleted += 1
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{ref.get('backend')}:{ref.get('key')}: {e}")
+    return deleted, errors
+
+
+def _dsar_clear_outbox(webhook_keys):
+    """Remove queued (pending + dead-letter) webhook deliveries fired by the erased sessions — they carry
+    the respondent's piped data. Matches on the intent's idempotency key. Returns the count removed.
+    Runs whether or not SURVEY_OUTBOX is enabled now, since items may remain from when it was."""
+    if not webhook_keys:
+        return 0
+    from survey_agent.integrations import outbox as outbox_mod
+    base = os.path.abspath(os.environ.get("SURVEY_OUTBOX_DIR")
+                           or os.path.join(os.environ.get("SURVEY_DATA_DIR", "./survey_data"), "outbox"))
+    if not os.path.isdir(base):          # nothing was ever queued — don't create the directory
+        return 0
+    return outbox_mod.Outbox(base).remove_by_idempotency_key(set(webhook_keys))
+
+
+_DSAR_OUTSIDE = ("Copies already delivered outside this app are NOT erased by this command: webhook / "
+                 "panel / CRM passbacks already sent, response backups (`survey-agent backup`), exports "
+                 "(CSV/Parquet/reports), log files, and any warehouse or downstream system. Erase the "
+                 "subject there too.")
+
+
+def _cmd_dsar(a):
+    """Find — and with --delete, erase — everything this app holds for one data subject: responses AND
+    sessions (partial, retakes, every survey) in the configured store, their uploaded files, and any
+    queued webhook deliveries. The subject is matched on every identity url-var in use (uid, the
+    SURVEY_RESPONDENT_VAR default, each survey's settings.identity.respondent, plus --id-field).
+
+    Copies already delivered elsewhere — passbacks, backups, exports, downstream warehouses — are
+    outside the app and still yours to erase."""
     import survey_agent.store as store_pkg
     store = store_pkg.get_store()
     uid, sid = a.uid, (a.survey or None)
+    fields, warnings = _dsar_id_fields(getattr(a, "id_field", None) or ())
+    for w in warnings:
+        print(f"⚠️  {w}", file=sys.stderr)
+    store_name = os.environ.get("SURVEY_STORE") or "memory"
     try:
-        rows = store.list_responses(survey_id=sid, uid=uid)
+        finder = getattr(store, "find_respondent", None)
+        if finder is not None:
+            found = finder(uid, id_fields=fields, survey_id=sid)
+            rows, sessions = found.get("responses", []), found.get("sessions", [])
+        else:  # a bring-your-own store without the respondent contract: responses only
+            rows, sessions = store.list_responses(survey_id=sid, uid=uid), []
+            warnings.append(f"the configured store ({store_name}) has no find_respondent(); sessions "
+                            "were not searched")
     except NotImplementedError as e:
-        msg = (f"the configured store ({os.environ.get('SURVEY_STORE') or 'memory'}) can't list "
-               f"responses this way: {e}. Run DSAR against the runtime's real store (file/sqlite/mongo).")
+        msg = (f"the configured store ({store_name}) can't look a respondent up this way: {e}. Run DSAR "
+               "against the runtime's real store (file/sqlite/mongo).")
         print(json.dumps({"error": msg}) if a.json else f"❌ {msg}")
         return 2
 
     if a.delete:
+        eraser = getattr(store, "erase_respondent", None)
         deleter = getattr(store, "delete_responses", None)
-        if deleter is None:
-            msg = (f"the configured store ({os.environ.get('SURVEY_STORE') or 'memory'}) has no "
-                   "delete_responses() — implement it on your store to support erasure.")
+        if eraser is None and deleter is None:
+            msg = (f"the configured store ({store_name}) has no erase_respondent() — implement it on "
+                   "your store to support erasure.")
             print(json.dumps({"error": msg}) if a.json else f"❌ {msg}")
             return 2
         if not a.yes:
             if a.json:
                 print(json.dumps({"error": "refusing to delete without --yes (non-interactive)"}))
                 return 2
-            confirm = input(f"Delete {len(rows)} response(s) for uid={uid}"
+            confirm = input(f"Erase {len(rows)} response(s) and {len(sessions)} session(s) for "
+                            f"{uid!r} (matched on {', '.join(fields)})"
                             + (f" in {sid}" if sid else " across all surveys") + "? [y/N] ")
             if confirm.strip().lower() not in ("y", "yes"):
                 print("aborted.")
                 return 1
-        n = deleter(uid=uid, survey_id=sid)
+        try:
+            if eraser is not None:
+                res = eraser(uid, id_fields=fields, survey_id=sid)
+            else:
+                n = deleter(uid=uid, survey_id=sid)
+                res = {"responses": n, "sessions": 0, "upload_refs": [], "webhook_keys": []}
+                warnings.append(f"the configured store ({store_name}) has only delete_responses(): "
+                                "sessions and uploaded files were NOT erased")
+        except NotImplementedError as e:
+            msg = f"the configured store ({store_name}) can't erase: {e}"
+            print(json.dumps({"error": msg}) if a.json else f"❌ {msg}")
+            return 2
+        up_deleted, up_errors = _dsar_delete_uploads(res.get("upload_refs") or [])
+        outbox_cleared = _dsar_clear_outbox(res.get("webhook_keys") or [])
+        out = {"action": "delete", "uid": uid, "survey_id": sid, "id_fields": fields,
+               "deleted": res.get("responses", 0), "sessions_deleted": res.get("sessions", 0),
+               "uploads_deleted": up_deleted, "upload_errors": up_errors,
+               "outbox_cleared": outbox_cleared, "warnings": warnings, "not_erased": _DSAR_OUTSIDE}
         if a.json:
-            print(json.dumps({"action": "delete", "uid": uid, "survey_id": sid, "deleted": n}, indent=2))
+            print(json.dumps(out, indent=2))
         else:
-            print(f"✅ erased {n} response(s) for uid={uid}.")
-            print("   Remember to clear any exports, backups, and downstream copies you hold.")
-        return 0
+            print(f"✅ erased {out['deleted']} response(s), {out['sessions_deleted']} session(s), "
+                  f"{up_deleted} uploaded file(s), {outbox_cleared} queued webhook delivery(ies) for "
+                  f"{uid!r} (matched on {', '.join(fields)}).")
+            for err in up_errors:
+                print(f"   ❌ upload not erased: {err}")
+            for w in warnings:
+                print(f"   ⚠️  {w}")
+            print(f"   {_DSAR_OUTSIDE}")
+        return 1 if up_errors else 0
 
     summary = [{"id": r.get("id"), "survey_id": r.get("survey_id"), "status": r.get("status"),
                 "date_submitted": r.get("date_submitted")} for r in rows]
+    sess_summary = [{"session_id": s.get("session_id"), "survey_id": s.get("survey_id"),
+                     "status": s.get("status"), "date_started": s.get("date_started")} for s in sessions]
     if a.json:
-        print(json.dumps({"action": "list", "uid": uid, "survey_id": sid,
-                          "count": len(rows), "responses": summary}, indent=2))
+        out = {"action": "list", "uid": uid, "survey_id": sid, "id_fields": fields,
+               "count": len(rows), "responses": summary,
+               "session_count": len(sessions), "sessions": sess_summary, "warnings": warnings}
+        if getattr(a, "full", False):
+            out["records"] = {"responses": rows, "sessions": sessions}
+        print(json.dumps(out, indent=2, default=str))
     else:
-        print(f"DSAR: {len(rows)} response(s) for uid={uid}" + (f" in {sid}" if sid else " (all surveys)"))
+        print(f"DSAR: {len(rows)} response(s), {len(sessions)} session(s) for {uid!r} "
+              f"(matched on {', '.join(fields)})" + (f" in {sid}" if sid else " (all surveys)"))
         for r in summary:
-            print(f"  - {r['survey_id'] or '?'}  {r['id'] or '?'}  {r['status'] or ''}  {r['date_submitted'] or ''}")
-        if rows:
-            print(f"\nTo erase: survey-agent dsar {uid} --delete")
+            print(f"  - response {r['survey_id'] or '?'}  {r['id'] or '?'}  {r['status'] or ''}  "
+                  f"{r['date_submitted'] or ''}")
+        for s_ in sess_summary:
+            print(f"  - session  {s_['survey_id'] or '?'}  {s_['status'] or ''}  {s_['date_started'] or ''}")
+        if rows or sessions:
+            print(f"\nFull records (access copy): survey-agent dsar {uid} --json --full")
+            print(f"To erase: survey-agent dsar {uid} --delete")
     return 0
 
 
@@ -2025,10 +2168,15 @@ def main(argv=None):
     s.add_argument("--dead", action="store_true", help="list: show the dead-letter queue instead of pending")
     s.add_argument("--json", action="store_true", help="machine-readable output")
     s.set_defaults(fn=_cmd_outbox)
-    s = sub.add_parser("dsar", help="find/erase a subject's responses by uid (DSAR / right-to-be-forgotten)")
-    s.add_argument("uid", help="the uid (url_variable) whose responses to find or erase")
+    s = sub.add_parser("dsar", help="find/erase a subject's data — responses, sessions, uploads (DSAR / right-to-be-forgotten)")
+    s.add_argument("uid", help="the respondent id, matched on every identity url var in use (uid, "
+                                "SURVEY_RESPONDENT_VAR, each survey's settings.identity.respondent)")
     s.add_argument("--survey", default=None, help="limit to one survey id (default: all surveys in the store)")
-    s.add_argument("--delete", action="store_true", help="erase the matching responses (default: list only)")
+    s.add_argument("--id-field", action="append", default=[],
+                   help="also match this url var name (repeatable) — e.g. an identity var from a retired survey")
+    s.add_argument("--full", action="store_true", help="with --json: include the full records (the access copy)")
+    s.add_argument("--delete", action="store_true",
+                   help="erase the matching responses, sessions, uploaded files and queued webhooks (default: list only)")
     s.add_argument("--yes", action="store_true", help="skip the confirmation prompt (required with --delete --json)")
     s.add_argument("--json", action="store_true", help="machine-readable output")
     s.set_defaults(fn=_cmd_dsar)

@@ -17,24 +17,30 @@ First public release.
   (`survey-agent schema`). A friendlier Markdown form compiles to it 1:1 (`compile`), and `render`
   turns JSON back into readable, logic-annotated Markdown.
 - Definitions are immutable and versioned; an edit creates a new version and in-flight sessions stay
-  pinned to the version they started on.
+  pinned to the version they started on. The `file` source keeps each version as a snapshot in
+  `surveys/.versions/<id>/v<N>.survey.json`. Identical content keeps its version; changed content
+  never reuses a number. If a session's version is no longer available, the respondent is asked to
+  reopen their link, which restarts them on the live version.
 - Question types: radio, checkbox (with an exclusive "none of the above"), dropdown, multi-select
   dropdown, short text (regex / email / phone / length / `min_words`), long text, number
   (min/max/percent), rating / Likert, NPS, ranking, grid / matrix (radio or checkbox cells), date, and
-  file upload (extension / size / count validated, stored in a pluggable local or S3 blob store).
+  file upload (extension / size / count validated before anything is stored, each upload under a
+  unique key in a pluggable local or S3 blob store; rejected uploads are deleted).
   Display-only image, video and instructions blocks render formatted Markdown.
 - Logic as a closed JSON AST, evaluated without `eval`: show/hide, page display, skip / branch,
   disqualify / screen-out, per-option and grid-row logic, nested AND/OR, and a fixed operator set.
-  Regular expressions are length- and complexity-bounded at validate time, and the input they run on
-  is capped.
+  Regular expressions are length- and complexity-bounded at validate time (no nested unbounded
+  quantifiers or repeated alternations), run on the `regex` engine (a core dependency) with a 50 ms
+  timeout per match, and match at most 2,000 characters of input.
 - Piping and merge tokens for answers, URL variables, variables and context facts (`{{q:…}}`,
   `{{url:…}}`, `{{var:…}}`, `{{ctx:…}}`), with fallbacks (`{{q:q_fav|your favourite}}`) and option
   piping that carries selected options forward. Piped values are shown as plain text.
 - Question and page repeating: ask a question or a whole page once per item from an earlier answer
   (selected or not-selected options) or N times from a number. Each item's answer is an ordinary key
   (`q_rate[netflix]`), so logic, piping, quotas and export need no special case.
-- Seeded, per-session randomization with locked positions; overall and per-option quotas enforced
-  atomically; hidden values and calculations (score / sum / bucket / count / arithmetic) usable in
+- Seeded, per-session randomization with locked positions; overall and per-option quotas, where a
+  completion atomically reserves every bucket it falls into and becomes the over-quota ending if any
+  is full; hidden values and calculations (score / sum / bucket / count / arithmetic) usable in
   logic, piping, quotas and routing; mid-survey webhook actions (fire once per session, HMAC-signed).
 - `settings.identity` names the URL variables that carry respondent and response identity (default
   `uid` and `rid`); `settings.retake` (`once` or `multiple`) controls whether an invite link can be
@@ -54,14 +60,22 @@ First public release.
 - A standard-library HTTP runtime (`serve`, `serve --multi`) that emits a drop-in `survey_url` and
   captures every query parameter. `serve --public` serves `live` surveys only; `serve --preview`
   serves drafts locally; `demo` runs the runtime with a mock receiver.
+- Respondent sessions carry an opaque per-session token; a submit must match it and the survey in the
+  URL, and the invite link is how a respondent resumes. A session's ending is processed once.
+- Request limits (`SURVEY_MAX_BODY_BYTES`, default 10 MB; `SURVEY_REQUEST_TIMEOUT`, default 30 s),
+  `Cache-Control: no-store` on survey pages and data, `Referrer-Policy: no-referrer` and
+  `X-Content-Type-Options: nosniff`, and logs that hash session/response ids and strip query strings
+  from URLs.
 - Lifecycle states (draft → validated → tested → approved → live → paused / closed), tracked in a
   registry sidecar; only serving states reach respondents, and `paused` / `closed` stop fielding.
-- Conversational delivery: the same survey administered as a chat (`convo`, `/chat`), with the engine
-  deciding flow, screen-outs and quotas, and the LLM only phrasing questions and mapping replies.
+- Conversational delivery: the same survey administered as a chat, with the engine deciding flow,
+  screen-outs and quotas, and the LLM only phrasing questions and mapping replies. `convo` and the
+  browser `/chat` (served only in demo/preview mode or with `SURVEY_CHAT_DEMO=1`) are previews that
+  record nothing; agents collect answers with `begin_survey` / `answer_survey`.
 - Signed URL parameters (`sign-url`, `settings.url_signing.required`) so eligibility values can't be
   edited in the address bar.
 - A human launch gate: when `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, no surface can mark a survey live
-  without it; the MCP connector always requires it.
+  without it; the MCP connector and the API gateway always require it.
 
 **Storage and integrations**
 - Response stores: `file` (default), `sqlite`, `memory`, a reference `mongo` backend, `http` (via the
@@ -70,7 +84,8 @@ First public release.
   published without a redeploy.
 - Completion integrations that deliver neutral lifecycle events with an idempotency key: `none`
   (default), `redirect`, `webhook`, a generic `panel` passback, a reference `mailchimp` adapter, or
-  your own plugin.
+  your own plugin. Events forward only the survey's declared `settings.url_variables` plus the
+  identity variables; every captured parameter is still stored on the response.
 - An optional durable outbox for webhook actions (`SURVEY_OUTBOX=1`, `outbox`).
 - Context enrichment: a `static` fixture provider, a reference warehouse adapter, or your own
   provider by import path. Optional `source: llm` analysis of open text runs at completion and is
@@ -84,7 +99,10 @@ First public release.
 - `console`: a local operator console with a board of surveys, preview, launch checks, lifecycle
   controls and response download.
 - Templates: `templates`, `new`, `copy` and `templatize`, with `${name}` parameters.
-- Data subject requests: `dsar <uid>` finds a respondent's responses, and `--delete` erases them.
+- Data subject requests: `dsar <id>` finds a respondent's responses and sessions, matched on every
+  identity variable in use (`--id-field` adds more; `--json --full` gives the access copy), and
+  `--delete` erases them along with their uploaded files and queued webhook deliveries. Copies
+  delivered outside the app (passbacks, backups, exports, logs, warehouses) must be erased there.
   `backup` / `restore` for responses; `defs-export` / `defs-import` / `defs-diff` for definitions.
 - `doctor` (resolved install, configuration and deployment checks), `help`, `docs`, `init`,
   `selftest`.
@@ -102,8 +120,15 @@ First public release.
 **API gateway**
 - `survey-agent api` (the `[api]` extra): an HTTP control plane for definitions and responses. It
   runs without authentication unless you configure a bearer token, Google OAuth (the `[auth]` extra)
-  or `sa_` API keys.
+  or `sa_` API keys. `[api]` alone runs bearer-token mode; the `/keys` page needs Google sign-in.
+  Session cookies are honoured only with Google sign-in and a strong `SURVEY_SESSION_JWT_KEY` (the
+  gateway refuses to start with a weak one, or without `[auth]` installed). Registry writes accept an
+  allowlist of fields, and any write that makes or changes what is live needs the launch approval.
 
 **Hosting**
 - A Dockerfile, a `Procfile`, Render blueprints, a Fly.io config and reference Terraform. The runtime
   derives its public URL from common hosts, and `doctor` reports whether it is reachable.
+- An allowlist `.dockerignore` (only the package source, packaging files, survey definitions,
+  registry, version snapshots and triggers reach the image), a `.gitignore` that keeps uploads,
+  `.env.*` files, local databases, backups, reports and exports out of git, and a `deploy.sh` that
+  stages only definition paths (`DEPLOY_PATHS` to override) and refuses to commit anything else.

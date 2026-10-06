@@ -2,7 +2,10 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+# Environment files hold secrets — every variant (.env.production, .env.local, ...) except the example.
 .env
+.env.*
+!.env.example
 
 # Personal, machine-local notes / walkthroughs — never committed.
 *.local.md
@@ -18,9 +21,20 @@ DEPLOY_WALKTHROUGH.md
 *.tfstate.*
 # Local survey response dumps + generated runtime/report artifacts (default output dir is ./reports;
 # override with SURVEY_OUTPUT_DIR or output.dir in survey-agent.config.yaml)
-/exports/
-/reports/
+exports/
+reports/
 survey_data/
+# Respondent file uploads (default SURVEY_UPLOAD_DIR) — respondent data, never commit.
+survey_uploads/
+# Local databases (the sqlite store defaults to survey_data/survey.db; WAL/SHM side files too)
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+# Response backups (`survey-agent backup` defaults to <output dir>/responses-backup.jsonl) + editor backups
+*-backup.jsonl
+*.bak
 # Survey-management lifecycle sidecar (local operational state; commit it instead if you want to
 # share validated/tested/live status across a team)
 .registry.json

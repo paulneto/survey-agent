@@ -21,10 +21,11 @@ pip install survey-agent
 > (with extras: `pip install "survey-agent[llm] @ git+https://github.com/paulneto/survey-agent"`),
 > or clone the repo and `pip install .`.
 
-The base install pulls only `jsonschema` + `pyyaml`. Optional extras: `[llm]` (Anthropic-powered
-authoring/analysis) or `[openai]` (GPT), `[api]` (the FastAPI control-plane gateway — `survey-agent
-api`), `[mcp]` (the connector), `[mongo]` (the *reference* multi-host store — just `pymongo`), and
-`[dev]` (tests). The `memory`, `file`, and `sqlite` stores need **no extra** (pure stdlib).
+The base install pulls only `jsonschema` + `pyyaml` + `regex`. Optional extras: `[llm]`
+(Anthropic-powered authoring/analysis) or `[openai]` (GPT), `[api]` (the FastAPI control-plane gateway
+— `survey-agent api`), `[mcp]` (the connector), `[mongo]` (the *reference* multi-host store — just
+`pymongo`), and `[dev]` (tests). The `memory`, `file`, and `sqlite` stores need **no extra** (pure
+stdlib).
 
 > **Which store?** Start with `file` (one box, one worker) → `sqlite` (one box, many workers,
 > concurrency-safe, still one file, no server) → a database only when storage is shared across hosts
@@ -146,7 +147,8 @@ survey-agent convo --scripted no
 ```
 
 (With a real LLM key the AI may add a follow-up probe turn, so a fixed script is for the offline
-stub.) The same chat runs in the browser at `/chat` under `survey-agent serve`/`demo`.
+stub.) The same chat runs in the browser at `/chat` under `survey-agent demo` or `serve --preview`.
+It is a preview: nothing is recorded.
 
 Conversation mode suits single-select, multi-select, number, and text questions. **Grids, rankings,
 and file uploads aren't supported in conversation mode**, and it doesn't fall back to a form, so

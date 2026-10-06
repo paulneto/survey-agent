@@ -76,10 +76,11 @@ survey-agent report   surveys/<slug>.survey.json --open
   self-correction signals, and the authoring rules.
 - Both should read **[LOGIC_IS_DATA.md](LOGIC_IS_DATA.md)** before writing any conditional logic.
 
-**Codex-specific:** outbound network is often restricted or off by default in sandboxed/cloud Codex. If
-`pip install` fails, that's the sandbox, not survey-agent — pre-install the dependency (it's just
-`jsonschema` + `PyYAML`) or enable egress. `validate`, `simulate` and `critique` need **no** network
-and **no** key once installed, so a fully offline sandbox still runs the entire correctness loop.
+**Codex-specific:** outbound network is often restricted or off by default in sandboxed/cloud Codex.
+If `pip install` fails, that's the sandbox, not survey-agent — pre-install the dependency (it's just
+`jsonschema` + `PyYAML` + `regex`) or enable egress. `validate`, `simulate` and `critique` need **no**
+network and **no** key once installed, so a fully offline sandbox still runs the entire correctness
+loop.
 
 ---
 
@@ -173,9 +174,9 @@ Three things stand between that and a real respondent, and each one is an operat
 3. **The launch approval.** When `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, nothing can mark a survey
    live without that token: not the CLI (`launch --approve TOKEN`, plus the operator checklist
    acknowledgement `--ack-responsibilities` or `SURVEY_OPERATOR_ACK=1`), not the console, not MCP.
-   When it is unset, the local CLI and console can mark a survey live, but the MCP connector still
-   can't: `launch_survey` always needs the token **and** `acknowledge_responsibilities=true`. Set the
-   token on any deployment where an agent drives the CLI.
+   When it is unset, the local CLI and console can mark a survey live, but the MCP connector (and the
+   API gateway) still can't: `launch_survey` always needs the token **and**
+   `acknowledge_responsibilities=true`. Set the token on any deployment where an agent drives the CLI.
 
 `launch` also prints the five operator responsibilities every time: response store, erasure/DSAR,
 consent and disclosure, URL integrity, and transport and access. See

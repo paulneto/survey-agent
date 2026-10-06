@@ -199,3 +199,38 @@ def test_get_provider_builtins_and_bad_names():
         get_provider("nonsense")
     with pytest.raises(ImportError):
         get_provider("no_such_pkg_xyz:Provider")
+
+
+# --- review R8: accepted patterns can't monopolize the process -----------------------------------
+def test_ambiguous_alternation_inside_a_repeat_is_rejected():
+    from survey_agent.engine.safety import regex_problem
+    for p in ("(a|aa)+$", "(x|xy)*z", "(?:ab|a)+b"):
+        assert regex_problem(p), p
+    for ok in (r"^\d{5}(-\d{4})?$", r"^[A-Z]{2}\d{6}$", r"^(cat|dog)$"):
+        assert regex_problem(ok) is None, ok
+
+
+def test_every_match_is_time_bounded(monkeypatch):
+    import time
+    from survey_agent.engine import safety
+    # a pattern that passes the static checks but does real backtracking work; with the timeout
+    # shrunk, the match is abandoned and reported as refused — the execution bound, not the heuristic
+    pattern = r".*a.*a.*a.*a.*a.*b"
+    assert safety.regex_problem(pattern) is None
+    monkeypatch.setattr(safety, "REGEX_TIMEOUT_SECONDS", 0.0005)
+    t = time.perf_counter()
+    assert safety.safe_search(pattern, "a" * 1999) is None            # timed out → refused
+    assert time.perf_counter() - t < 0.5
+    monkeypatch.setattr(safety, "REGEX_TIMEOUT_SECONDS", 0.05)
+    assert safety.safe_search(r"^\d{5}$", "12345") is True
+
+
+def test_reviewers_pattern_cannot_hang_even_if_it_got_past_the_gate():
+    import time
+    from survey_agent.engine import safety
+    t = time.perf_counter()
+    try:
+        safety._compiled("(a|aa)+$").search("a" * 100 + "!", timeout=safety.REGEX_TIMEOUT_SECONDS)
+    except TimeoutError:
+        pass
+    assert time.perf_counter() - t < 0.5

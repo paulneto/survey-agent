@@ -18,11 +18,20 @@ import json
 import os
 import time
 
+from survey_agent.obs import redact_url
+
+
+def _intent_key(intent):
+    """The intent's idempotency key: top-level (what the engine's webhook intents carry), else a
+    legacy `payload.idempotency_key`."""
+    intent = intent or {}
+    return intent.get("idempotency_key") or (intent.get("payload") or {}).get("idempotency_key")
+
 
 def _intent_id(intent):
     """Stable id for an intent: its idempotency_key if present, else a content hash. Webhook actions
     fire once per session, so the content hash uniquely (and idempotently) identifies a delivery."""
-    key = (intent.get("payload") or {}).get("idempotency_key")
+    key = _intent_key(intent)
     if key:
         return "k_" + hashlib.sha1(str(key).encode()).hexdigest()[:16]
     return "h_" + hashlib.sha1(json.dumps(intent, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -100,6 +109,31 @@ class Outbox:
         return {"attempted": attempted, "delivered": delivered, "dead": dead,
                 "pending": self.stats()["pending"]}
 
+    def remove_by_idempotency_key(self, keys):
+        """Erasure hook (DSAR): delete every queued item — pending AND dead-letter — whose intent
+        carries one of `keys` as its idempotency key. Returns the number of items removed."""
+        want = {str(k) for k in (keys or []) if k}
+        if not want:
+            return 0
+        removed = 0
+        for d in (self.dir, self.dead_dir):
+            for name in os.listdir(d):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(d, name)
+                try:
+                    with open(path) as f:
+                        rec = json.load(f)
+                except Exception:
+                    continue
+                if str(_intent_key(rec.get("intent")) or "") in want:
+                    try:
+                        os.remove(path)
+                        removed += 1
+                    except FileNotFoundError:
+                        pass
+        return removed
+
     def stats(self):
         pending = sum(1 for n in os.listdir(self.dir) if n.endswith(".json") and not n.endswith(".tmp"))
         dead = sum(1 for n in os.listdir(self.dead_dir) if n.endswith(".json"))
@@ -116,7 +150,7 @@ class Outbox:
                     rec = json.load(f)
                 out.append({"id": rec.get("id"), "attempts": rec.get("attempts"),
                             "last_error": rec.get("last_error"),
-                            "url": (rec.get("intent") or {}).get("url")})
+                            "url": redact_url((rec.get("intent") or {}).get("url"))})
             except Exception:
                 continue
         return out

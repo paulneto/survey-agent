@@ -55,7 +55,7 @@ Three things are out of scope on purpose, and they shape the rest of the table:
 | Minimum words | ✅ | `min_words`, a model-free guard against one-word answers |
 | Email | ✅ | `format: email` |
 | Phone | ✅ | `format: phone` with `phone_region`: `us`, `uk` or `intl` |
-| Regular expression | ✅ | `regex` + `regex_message`; `validate` rejects patterns over 200 characters or with nested unbounded quantifiers, and at most 2,000 characters of input are matched |
+| Regular expression | ✅ | `regex` + `regex_message`; `validate` rejects patterns over 200 characters, with nested unbounded quantifiers, or with an alternation inside a repeated group; at most 2,000 characters of input are matched, with a 50 ms timeout per match |
 | Date bounds | ✅ | `min` / `max` on `date` |
 | File constraints | ✅ | `extensions`, `max_files`, `max_size_kb` |
 | Custom error text | ✅ | `format_message`, `regex_message` |
@@ -126,7 +126,7 @@ leaves with `and` / `or`, and groups nest. Details in [LOGIC_IS_DATA.md](LOGIC_I
 | Overall cap | ✅ | `scope: survey` + `limit` |
 | Cell quota | ✅ | `scope: answer` + `ref` + `match`; the `ref` can be a question, URL variable, variable (including a computed segment) or enrichment fact |
 | Act when full | ✅ | `is_full` in an `overquota` (or any) action's `when` |
-| Counting | ✅ | completes are counted per survey version in the configured store |
+| Counting | ✅ | completes are counted per survey version in the configured store. A completion atomically reserves a slot in every quota it falls into; if any is full, it becomes the survey's over-quota ending instead |
 | Soft quota (warn but continue) | ⬜ | |
 | Panel-wide or cross-survey quotas | ⊘ | belong to your panel or sampling system |
 
@@ -155,7 +155,7 @@ leaves with `and` / `or`, and groups nest. Details in [LOGIC_IS_DATA.md](LOGIC_I
 | Mid-survey webhook | ✅ | `webhook` action, gated by `when`, fires once per session; optional durable outbox (`SURVEY_OUTBOX=1`) for these actions |
 | Abandonment detection | ⬜ | the stdlib runtime never emits `terminated_by_user` on its own |
 | Email notifications | ⬜ | no send-email integration; write one against the integration seam |
-| Conversational delivery | ◑ | the same survey runs as a chat (`convo`, `/chat`, MCP `begin_survey`); grids, rankings and file uploads aren't supported in chat — use the form for those. See [AGENTIC_MODES.md](AGENTIC_MODES.md) |
+| Conversational delivery | ◑ | the same survey runs as a chat (MCP `begin_survey`, plus the `convo` and `/chat` previews, which record nothing); grids, rankings and file uploads aren't supported in chat — use the form for those. See [AGENTIC_MODES.md](AGENTIC_MODES.md) |
 | Themes | ✅ | built-in `dark`, `ocean`, `paper` over a shared base; your own via `SURVEY_THEMES_DIR`; per-survey `css` |
 | Mobile layout | ✅ | responsive pages, fluid media, scrolling grids, matching mobile keyboards |
 | Translations | ⬜ | no built-in multi-language surveys; pass `lang` and branch on it, or field one survey per language |
@@ -190,7 +190,7 @@ leaves with `and` / `or`, and groups nest. Details in [LOGIC_IS_DATA.md](LOGIC_I
 | Persona pre-test | ✅ | `pretest`, optionally against a declared audience. See [PERSONAS.md](PERSONAS.md) |
 | Methodology critique | ✅ | `critique`; advisory |
 | Markdown authoring | ✅ | `compile` turns a `.md` survey into JSON |
-| Versioning | ◑ | each survey carries a `version`, and quota counts are kept per version. `publish` to the `mongo` definition source bumps the version on any content change; with the default `file` source you bump `version` yourself |
+| Versioning | ◑ | each survey carries a `version`, and quota counts are kept per version. changed content always gets a new version number, and in-progress respondents finish on the version they started. The `file` source keeps snapshots in `surveys/.versions/` (commit them); `mongo` keeps every version in the store |
 | Templates | ✅ | `templates`, `new`, `copy`, `templatize` |
 | Serving gate | ✅ | `serve --public` serves only `live` surveys (`SURVEY_SERVE_STATES` to change); others show a "not open yet" page |
 | Pause / close | ✅ | `survey-agent status <id> --set paused\|closed`; `--set live` resumes |
@@ -205,7 +205,7 @@ leaves with `and` / `or`, and groups nest. Details in [LOGIC_IS_DATA.md](LOGIC_I
 | Capability | Status | Notes |
 |---|---|---|
 | No code in survey definitions | ✅ | the engine interprets a closed logic language; there is no `eval` |
-| Data-subject requests | ✅ | `survey-agent dsar <uid>` finds a respondent's responses and, with `--delete`, erases them from the configured store; backups and downstream copies are yours to handle |
+| Data-subject requests | ✅ | `survey-agent dsar <id>` finds a respondent's responses and sessions (matched on every identity variable in use) and, with `--delete`, erases them plus uploaded files and queued webhook deliveries; passbacks already sent, backups and downstream copies are yours to handle |
 | Rate limiting | ◑ | opt-in, per instance (`SURVEY_RATE_LIMIT`); use a load balancer or WAF for a global cap |
 | Client metadata capture | ◑ | opt-in (`SURVEY_CAPTURE_CLIENT_META`): IP, user agent and a browser fingerprint stored on the response for your own fraud review |
 | Anti-fraud settings | ◑ | `settings.anti_fraud` (`attention_checks`, `min_page_seconds`, `block_duplicate_uid`) is declared but not enforced by the engine yet; write an attention check as an ordinary screen-out rule |

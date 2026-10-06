@@ -128,11 +128,16 @@ The `video` type is display-only and stores no respondent data, but it embeds th
 - **Access to raw data:** `export`, `report`, `backup` and the MCP reporting tools read whatever store
   they're pointed at; `/api/responses` requires `SURVEY_API_TOKEN`. Role-based access and audit
   logging of exports are not provided — add them at your gateway/proxy if you need them.
-- **Right to erasure / DSAR: built in for the store.** `survey-agent dsar <uid>` lists a person's
-  responses in the stable export shape; `survey-agent dsar <uid> --delete` erases them (`--survey ID`
-  to limit, `--json` for a scriptable record). Every built-in store implements
-  `delete_responses(uid, survey_id)`; a custom store must too. **Still yours:** backups, exports,
-  copies already delivered to webhooks/panels/CRMs, and downstream warehouses.
+- **Right to erasure / DSAR: built in for what the app holds.** `survey-agent dsar <id>` lists a
+  person's responses and sessions (partial takes and retakes included, across every survey);
+  `--json --full` returns the full records as the access copy. `survey-agent dsar <id> --delete`
+  erases the responses, the sessions, their uploaded files and any queued webhook deliveries
+  (`--survey ID` to limit, `--json` for a scriptable record). The id is matched on every identity
+  variable in use: `uid`, `SURVEY_RESPONDENT_VAR`, each survey's `settings.identity.respondent`, and
+  any `--id-field` you add (repeatable, e.g. for a retired survey's variable). Every built-in store
+  implements `find_respondent` / `erase_respondent`; a custom store must too. **Still yours:** copies
+  delivered outside the app — passbacks already sent to webhooks/panels/CRMs, backups, exports, log
+  files and downstream warehouses. The command says so when it finishes.
 - **Retention:** survey-agent does not expire responses or sessions. Define a retention policy and
   enforce it (e.g. a scheduled `dsar --delete`, or store-level TTLs).
 
@@ -140,8 +145,9 @@ The `video` type is display-only and stores no respondent data, but it embeds th
 - **Respondent runtime** (`survey-agent serve`): the only piece that must be public. It doesn't need
   model keys unless you use conversation mode or `source: llm` analysis.
 - **API gateway** (`survey-agent api`): **runs open — no authentication — unless you configure it**
-  with `SURVEY_API_TOKEN` (bearer), Google OAuth (`[auth]` extra, `SURVEY_OAUTH_*`), or `sa_` API
-  keys. Don't expose it without one of these.
+  with `SURVEY_API_TOKEN` (bearer), `sa_` API keys, or Google OAuth (`[auth]` extra,
+  `SURVEY_GOOGLE_CLIENT_ID` / `_SECRET`). Don't expose it without one of these. Session cookies are
+  honoured only with Google sign-in and a strong `SURVEY_SESSION_JWT_KEY` (at least 32 characters).
 - **Operator console** (`survey-agent console`, `/manage` with `SURVEY_CONSOLE=1`): binds `127.0.0.1`
   and is unauthenticated by design. Put your own auth (proxy, VPN) in front if you expose it.
 - **Organization/tenant scoping is not provided.** Anyone with access to a store or gateway sees all
@@ -158,21 +164,24 @@ The `video` type is display-only and stores no respondent data, but it embeds th
 
 ### Observability (without leaking)
 - The runtime logs via the `survey_agent` logger (`SURVEY_LOG_LEVEL`, `SURVEY_LOG_FORMAT=json`) and
-  logs identifiers and statuses, not answers. Keep any custom code to the same rule: **never log
-  answers, free text, enrichment values, or full `url_variables`.**
+  logs identifiers and statuses, not answers. Session and response ids are logged as a short stable
+  hash (a session id encodes the invite and respondent ids), and URLs are reduced to scheme, host and
+  path, with no query string. Keep any custom code to the same rule: **never log answers, free text,
+  enrichment values, or full `url_variables`.**
 - **Audit logging** of authoring actions, exports and erasures is **not provided** beyond the
   per-response `llm_audit`. If you need it, record it at your gateway, proxy, or CI.
 
 ### Supply chain
-- The engine is small (about 2,600 lines) with minimal dependencies (standard library plus
-  `jsonschema` and `PyYAML`).
+- The engine is small (about 2,700 lines) with minimal dependencies (standard library plus
+  `jsonschema`, `PyYAML` and `regex`).
 - **Plugins are code** (stores, definition sources, integrations, enrichment providers loaded by
   import path). They run in your process and can read responses. Vet, pin, and review them.
 
 ### Connectors (the agentic surface)
 - The MCP server runs locally over stdio by default. For a remote connector
   (`--transport streamable-http`), **you** must put OAuth in front; survey-agent does not ship MCP OAuth.
-- The launch gate applies: the MCP connector cannot mark a survey live without the approval token.
+- The launch gate applies: neither the MCP connector nor the API gateway can mark a survey live without
+  the approval token.
 
 ## Compliance posture
 - survey-agent provides building blocks: consent/notice text, signed URLs and webhooks, a stable
@@ -191,7 +200,7 @@ The `video` type is display-only and stores no respondent data, but it embeds th
       operator can reach the CLI/console.
 - [ ] LLM use reviewed: conversation mode, `source: llm` analysis and `insights` are disclosed in the
       consent/notice text; you're comfortable with the provider's data terms.
-- [ ] Redaction (if needed) handled in your own pipeline; `dsar <uid> --delete` tested against your
+- [ ] Redaction (if needed) handled in your own pipeline; `dsar <id> --delete` tested against your
       store; plan for backups and downstream copies.
 - [ ] API gateway has auth configured; console not publicly reachable.
 - [ ] Webhook targets reviewed; outbox enabled if webhook actions must not be lost.

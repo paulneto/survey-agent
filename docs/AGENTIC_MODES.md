@@ -67,8 +67,10 @@ including a **quota on a computed segment**. Code: `engine/calc.py`.
 An AI **administers the survey as a chat**, using the **same survey JSON**. The engine stays the
 source of truth for flow, branching, screen-outs, quotas and validation. The LLM only (a) **phrases**
 each question and (b) **maps the free-text reply to a valid answer**, which the engine then validates
-before advancing. Run it with `survey-agent convo`, at `/chat` on the runtime, or over MCP (§6).
-Code: `conversation.py`.
+before advancing. Run it with `survey-agent convo`, over MCP (§6), or as a preview at `/chat` on the
+runtime. The browser chat records nothing and is served only in demo/preview mode (`demo`,
+`serve --preview`) or with `SURVEY_CHAT_DEMO=1`; the MCP tools are the supported way to collect
+answers conversationally. Code: `conversation.py`.
 
 ```
 engine: "next eligible question + valid answers"  ──▶  LLM phrases it  ──▶  respondent replies freely

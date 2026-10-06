@@ -284,16 +284,18 @@ def test_validator_rejects_logic_on_an_answer_from_the_same_page():
 
 # ----------------------------------------------------------------------- HTTP runtime
 def test_http_runtime_walks_a_repeated_page():
-    from test_server_http import _get, _post, running_server
+    from test_server_http import _get, _post, _tok, running_server
     with running_server(_survey()) as base:
         _, html = _get(f"{base}/s/rep?uid=1&rid=2")
         sid = re.search(r'name=session_id value="([^"]+)"', html).group(1)
-        _, html = _post(f"{base}/s/rep/submit", [("session_id", sid), ("page_id", "p_brands"),
+        tok = _tok(html)
+        _, html = _post(f"{base}/s/rep/submit", [("session_id", sid), ("session_token", tok), ("page_id", "p_brands"),
                                                    ("q_brands", "netflix"), ("q_brands", "hulu")])
         assert "About Netflix (1 of 2)" in html and 'name="q_rate[netflix]"' in html
         pid = re.search(r'name=page_id value="([^"]+)"', html).group(1)
         assert pid == "p_rate[netflix]"
-        _, html = _post(f"{base}/s/rep/submit", {"session_id": sid, "page_id": pid, "q_rate[netflix]": "5"})
+        _, html = _post(f"{base}/s/rep/submit", {"session_id": sid, "session_token": tok, "page_id": pid,
+                                                 "q_rate[netflix]": "5"})
         assert "About Hulu (2 of 2)" in html
 
 

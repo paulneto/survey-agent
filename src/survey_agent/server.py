@@ -12,9 +12,11 @@ Run standalone (expects a mock receiver on :9000):
     python -m survey_agent.server          # or set SURVEY_FILE=... to serve a specific survey
 Or `survey-agent demo` to start the runtime + a mock receiver together.
 """
+import hmac
 import json
 import os
 import re
+import secrets
 import signal
 import sys
 import threading
@@ -23,6 +25,7 @@ import urllib.request
 from datetime import datetime, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import OrderedDict
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -60,6 +63,22 @@ API_TOKEN = os.environ.get("SURVEY_API_TOKEN")
 URL_SECRET = os.environ.get("SURVEY_URL_SECRET")
 
 WEBHOOK_URL = os.environ.get("SURVEY_WEBHOOK_URL", "http://127.0.0.1:9000/hook")   # only used by the webhook integration
+
+
+def _int_env(name, default):
+    try:
+        return int(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+# Request-body caps, enforced from Content-Length BEFORE anything is read/allocated (413 beyond).
+# Form posts (incl. multipart `file` uploads) get SURVEY_MAX_BODY_BYTES; the JSON chat endpoint a small
+# fixed cap. Per-file limits are the question's own validation (checked before any bytes are stored).
+MAX_BODY_BYTES = _int_env("SURVEY_MAX_BODY_BYTES", 10 * 1024 * 1024)
+MAX_JSON_BODY_BYTES = 64 * 1024
+# Socket timeout (seconds) per request so a slow/stalled client can't pin a handler thread.
+REQUEST_TIMEOUT = _int_env("SURVEY_REQUEST_TIMEOUT", 30)
 
 # Opt-in per-IP rate limiter (SURVEY_RATE_LIMIT="60/min"); None ⇒ off. Applied to survey-serving
 # paths only (page loads + submit), never to /health.
@@ -144,6 +163,57 @@ def load_rt(survey_id):
     return rt
 
 
+def _rt_at(survey_id, version):
+    """The runtime for an EXACT definition version (cached per (survey_id, version)), or None when the
+    definition store can't produce that version. Used to keep an in-flight session on the version it
+    started on (sessions are pinned; a republish never changes questions/routing/quotas under them)."""
+    key = (survey_id, version)
+    if key in _RT_CACHE:
+        return _RT_CACHE[key]
+    try:
+        spec = defstore().get_definition(survey_id, version=version)
+    except Exception:
+        log.exception("failed to load pinned definition", extra={"survey_id": survey_id, "version": version})
+        return None
+    if spec is None:
+        return None
+    try:
+        rt = SurveyRuntime(spec)
+    except Exception:
+        log.exception("failed to build runtime", extra={"survey_id": survey_id, "version": version})
+        return None
+    if rt.d.get("version", 1) != version:     # backend ignored the version (e.g. kept only the latest)
+        return None
+    _RT_CACHE[key] = rt
+    return rt
+
+
+def rt_for_session(survey_id, session, live_rt):
+    """Resolve the runtime a session must run on: its pinned `version` (else the live one). Returns
+    None when the pinned version can't be loaded (e.g. a fresh deploy without the `.versions/`
+    snapshot) — never silently switches an in-flight session onto different content. Callers decide:
+    a GET on the invite link restarts the take on the live version; a POST asks the respondent to
+    reopen their link (see _SURVEY_UPDATED_HTML)."""
+    if live_rt is None or not session:
+        return live_rt
+    version = session.get("version")
+    if version is None or version == live_rt.d.get("version", 1):
+        return live_rt
+    if not MULTI and RT is not None and version == RT.d.get("version", 1):
+        return RT
+    rt = _rt_at(survey_id, version)
+    if rt is None:
+        log.warning("pinned survey version unavailable", extra={
+            "survey_id": survey_id, "version": version, "live_version": live_rt.d.get("version", 1),
+            "session_id": session.get("session_id")})
+    return rt
+
+
+_SURVEY_UPDATED_HTML = ("<div class='term'><h1>This survey was updated</h1><p>The version you started is "
+                        "no longer available. Please reopen the original link you were sent to start "
+                        "again.</p></div>")
+
+
 if MULTI:
     SPEC = RT = None
     VER, LIMITS, _SIGN_CFG, SIGN_REQUIRED, SIGN_FIELDS = 1, {}, {}, False, []
@@ -170,6 +240,18 @@ def upload_store():
         from survey_agent.store import uploads as _uploads
         _UPLOAD_STORE = _uploads.get_upload_store()
     return _UPLOAD_STORE
+
+
+def _delete_uploads(refs):
+    """Best-effort removal of stored upload bytes (a rejected/stale submit). Never raises."""
+    if not refs:
+        return
+    us = upload_store()
+    for ref in refs:
+        try:
+            us.delete(ref)
+        except Exception:
+            log.warning("failed to delete rejected upload", extra={"key": (ref or {}).get("key")})
 
 
 def parse_post(headers, body):
@@ -308,6 +390,61 @@ def _signature_ok(query, rt=None):
     return signing.verify(query, URL_SECRET, fields)
 
 
+def _new_session_token():
+    """An opaque per-session capability. The resume key (survey:rid:uid) is guessable; a submit must
+    also carry this token, which is only ever handed out on a page rendered for the invite link."""
+    return secrets.token_urlsafe(24)
+
+
+def ensure_session_fields(session, rt):
+    """Backfill fields added after a session was created (in-flight sessions from an older release):
+    the submit token, and the passback url-var allowlist. Returns True if the session changed."""
+    changed = False
+    if not session.get("token"):
+        session["token"] = _new_session_token()
+        changed = True
+    if "passback_vars" not in session:
+        session["passback_vars"] = rt.passback_vars()
+        changed = True
+    return changed
+
+
+def _token_ok(session, token):
+    want = (session or {}).get("token")
+    return bool(want) and bool(token) and hmac.compare_digest(str(token), str(want))
+
+
+# Per-session serialization inside this process (striped, so memory stays bounded): one respondent's
+# concurrent submits / reloads are processed one at a time, so a terminal is recorded once.
+_SESSION_LOCKS = [threading.Lock() for _ in range(64)]
+
+
+def _session_lock(session_id):
+    import zlib
+    return _SESSION_LOCKS[zlib.crc32(str(session_id).encode()) % len(_SESSION_LOCKS)]
+
+
+_QUOTA_FALLBACK_LOCK = threading.Lock()
+
+
+def reserve_quotas(survey_id, version, limits):
+    """Atomically take one slot in every bucket of `limits` ({quota_id: limit|None}) iff each limited
+    one is below its limit — all-or-nothing. Delegates to the store's atomic `reserve_quotas`; a store
+    without it gets a process-local check-and-increment (correct for one runtime process only)."""
+    if not limits:
+        return True
+    fn = getattr(STORE, "reserve_quotas", None)
+    if callable(fn):
+        return bool(fn(survey_id, version, limits))
+    with _QUOTA_FALLBACK_LOCK:
+        counts = STORE.quota_counts(survey_id, version)
+        if any(lim is not None and counts.get(qid, 0) >= lim for qid, lim in limits.items()):
+            return False
+        for qid in limits:
+            STORE.incr_quota(survey_id, version, qid)
+        return True
+
+
 def quota_state(rt=None):
     rt = rt or RT
     ver = rt.d.get("version", 1)
@@ -330,19 +467,26 @@ def _mint_response_id():
 
 
 def on_terminal(session, terminal, rt=None):
+    """Accept a terminal: reserve quota (complete only), record the response once, fire the passback.
+    Returns the terminal actually applied — a `complete` that loses the race for the last quota slot
+    comes back as the survey's over-quota terminal. Idempotent per session: a session whose terminal
+    was already recorded is never re-reserved, re-recorded or re-fired."""
     rt = rt or RT
+    if session.get("terminal_recorded"):
+        return terminal
     if session.get("preview"):                  # operator preview: walk the flow, but record/passback nothing
         session["date_submitted"] = now_iso()
+        session["terminal_recorded"] = True
         STORE.save_session(session)
-        return
+        return terminal
     ver = rt.d.get("version", 1)
     limits = _limits_for(rt)
     if terminal["status"] == "completed":
-        counts = STORE.quota_counts(rt.d["id"], ver)
-        for qid in rt.quota_buckets(session):
-            lim = limits.get(qid)
-            if lim is None or counts.get(qid, 0) < lim:
-                STORE.incr_quota(rt.d["id"], ver, qid)
+        # Atomic all-or-nothing reservation BEFORE the completion is accepted: two respondents racing
+        # for the last slot can't both complete (the engine's is_full check ran on a snapshot).
+        want = {qid: limits.get(qid) for qid in rt.quota_buckets(session)}
+        if want and not reserve_quotas(rt.d["id"], ver, want):
+            terminal = rt.overquota_terminal(session)
     # opt-in, audited LLM analysis on the respondent's answers (fail-open). Lands in the response
     # (derived + llm_audit) and can be piped to screen.
     try:
@@ -353,10 +497,12 @@ def on_terminal(session, terminal, rt=None):
     except Exception:
         pass
     session["date_submitted"] = now_iso()
+    session["terminal_recorded"] = True
     STORE.save_session(session)
     STORE.record_response(rt.d["id"], export.response_from_session(
         rt, session, session.get("date_started"), session.get("date_submitted")))
     INTEGRATION.terminal(session, terminal["status"], reason_code=terminal.get("reason_code"))
+    return terminal
 
 
 # ----------------------------------------------------------------- HTML
@@ -616,6 +762,7 @@ def render_page(survey_id, session, step, rt=None):
     body = (notice + title_h1 + page_title
             + f'<form method=post action="/s/{survey_id}/submit"{enc}>'
             f'<input type=hidden name=session_id value="{escape(session["session_id"])}">'
+            f'<input type=hidden name=session_token value="{escape(session.get("token") or "")}">'
             f'<input type=hidden name=page_id value="{escape(page["page_id"])}">'
             f'{fp_field}{qs}<button>{btn}</button></form>')
     return _html(body, rt.d["title"], theme=theme)
@@ -680,8 +827,9 @@ def landing(theme=None):
             f'their <b>own</b> behavioral history (the demo stands in for your data warehouse). Open one and watch '
             f'whether the “why did you search…?” page appears — it’s gated on whether <i>that</i> person '
             f'actually searched for a streaming service.</p>'
-            f'<p class="lead">💬 <b><a href="/chat{qtheme}">Take the same survey as a conversation →</a></b> '
-            f'(the identical JSON, delivered as a chat — with one adaptive AI follow-up).</p>'
+            + (f'<p class="lead">💬 <b><a href="/chat{qtheme}">Take the same survey as a conversation →</a></b> '
+               f'(the identical JSON, delivered as a chat — with one adaptive AI follow-up; a preview, '
+               f'nothing is recorded).</p>' if _chat_enabled() else "")
             + "".join(cards) +
             f'<p class="meta">Then try the screen-outs (consent “No”, “Never used”, wrong attention answer). '
             f'Watch the receiver terminal for passbacks; storage = {os.environ.get("SURVEY_STORE") or "memory"}.</p>')
@@ -751,15 +899,32 @@ def multi_landing(theme=None):
         "</div></body></html>")
 
 
+class _BodyError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
 class Handler(BaseHTTPRequestHandler):
+    timeout = REQUEST_TIMEOUT                    # per-connection socket timeout (slow-client guard)
+
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+    def _security_headers(self, cache=False):
+        """Survey pages, terminal pages and data responses carry respondent data and capability-bearing
+        URLs/fields: never cache them, never leak the URL as a Referer, never content-sniff."""
+        if not cache:
+            self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8", cache=False):
         data = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self._security_headers(cache=cache)
         self.end_headers()
         self.wfile.write(data)
 
@@ -768,7 +933,40 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Location", url)
         self.send_header("Content-Length", "0")
+        self._security_headers()
         self.end_headers()
+
+    def _read_body(self, limit):
+        """Read the request body, refusing BEFORE allocation: a missing/invalid Content-Length is 411/400
+        and one over `limit` is 413 (raised as _BodyError). Reads in bounded chunks; a short body
+        (client hung up / timed out) is a 400."""
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+                raise _BodyError(411, "chunked request bodies are not accepted; send Content-Length")
+            raise _BodyError(411, "Content-Length required")
+        try:
+            length = int(raw.strip())
+        except (TypeError, ValueError):
+            raise _BodyError(400, "invalid Content-Length")
+        if length < 0:
+            raise _BodyError(400, "invalid Content-Length")
+        if length > limit:
+            raise _BodyError(413, "request body too large")
+        chunks, remaining = [], length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 64 * 1024))
+            if not chunk:
+                raise _BodyError(400, "incomplete request body")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _body_error(self, err, json_body=False):
+        self.close_connection = True          # the unread body must not be parsed as the next request
+        if json_body:
+            return self._send(err.code, json.dumps({"error": err.message}), ctype="application/json")
+        return self._send(err.code, _html(f"<p>{escape(err.message)}</p>"))
 
     def _client_ip(self):
         return client_meta(self.headers, self.client_address).get("ip") or "-"
@@ -798,18 +996,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/responses" or path.startswith("/api/responses/"):
             return self._api_responses(path, query)
         if path == "/chat":
-            if MULTI:
-                rt = load_rt(query.get("survey"))
-                if rt is None:
-                    return self._send(404, _html("<p>Open <code>/chat?survey=&lt;id&gt;</code> for a specific "
-                                                 "survey, or pick one from <a href='/'>the index</a>.</p>"))
-                st = None if _serve_all_states() else _survey_state(query.get("survey"))
-                if st in ("paused", "closed"):
-                    return self._send(200, _closed_page(st, theme=query.get("theme")))
-                if st is not None and st not in _serve_states() and not _preview_ok(query):
-                    return self._send(200, _not_open_page(theme=query.get("theme")))
-                return self._send(200, chat_page(query.get("theme"), rt, query.get("survey")))
-            return self._send(200, chat_page(query.get("theme")))
+            # Browser chat is a demo/preview surface: it never records responses, so it is only served
+            # when the runtime is in demo/preview mode (see _chat_enabled).
+            if not _chat_enabled():
+                return self._send(404, _html("<p>Not found</p>"))
+            survey_id = query.get("survey") if MULTI else (RT.d["id"] if RT else None)
+            rt = load_rt(survey_id) if MULTI else RT
+            if rt is None:
+                return self._send(404, _html("<p>Open <code>/chat?survey=&lt;id&gt;</code> for a specific "
+                                             "survey, or pick one from <a href='/'>the index</a>.</p>"))
+            gate = _chat_gate(survey_id, query)
+            if gate:
+                return self._send(200, gate)
+            return self._send(200, chat_page(query.get("theme"), rt, survey_id,
+                                             preview=query.get("preview") if _preview_ok(query) else None))
         if path == "/favicon.ico":
             return self._send(204, b"")
         if path.startswith("/assets/"):
@@ -821,7 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
             if rel.startswith("..") or not os.path.isfile(fp):
                 return self._send(404, _html("<p>Not found</p>"))
             with open(fp, "rb") as fh:
-                return self._send(200, fh.read(),
+                return self._send(200, fh.read(), cache=True,
                                   ctype=mimetypes.guess_type(fp)[0] or "application/octet-stream")
         if path == "/ledger":
             try:
@@ -882,47 +1082,77 @@ class Handler(BaseHTTPRequestHandler):
                     "<div class='term'><h1>Link not valid</h1><p>This survey link is missing or has an "
                     "invalid signature. Please open the original link you were sent.</p></div>", theme=theme))
             uid, rid = rt.identity(query)          # configurable identity vars (settings.identity)
-            session, created = STORE.get_or_create_session(
-                survey_id, rid, uid,
-                lambda: dict(rt.new_session(f"{survey_id}:{rid}:{uid}", query,
-                                            response_id=_mint_response_id()),
-                             date_started=now_iso(), **({"preview": True} if preview else {})))
-            if theme:  # the theme chosen on the landing page sticks to the whole session
-                session["theme"] = theme
-                STORE.save_session(session)
-            if session["status"] in TERMINAL_STATUSES:
-                if rt.retake != "multiple" and not session.get("preview"):  # default "once": a finished link is locked
-                    return self._send(200, _html(_html_inner_terminal_again(), theme=session_theme(session, rt)))
-                # retake="multiple" (or a preview run): start a fresh take. The finished response was
-                # already recorded (on_terminal), so we reuse the session doc (same resume key
-                # survey:rid:uid) but mint a NEW unique response_id → a distinct response + passback.
-                # In-progress sessions are NOT touched (they resume above).
-                was_preview = session.get("preview")
-                session = dict(rt.new_session(session["session_id"], query,
-                                              response_id=_mint_response_id()), date_started=now_iso())
-                if was_preview or preview:
-                    session["preview"] = True
-                if theme:
-                    session["theme"] = theme
-                STORE.save_session(session)
-                created = True
-            if created:
-                if _capture_client_meta():
-                    session["client"] = client_meta(self.headers, self.client_address)
-                INTEGRATION.started(session)
-                # prefetch-on-start: only for respondents who actually begin. In prod this is
-                # an async warm against your warehouse/cache while the intro page renders; here static
-                # fixtures resolve instantly. Values land on the session for piping + logic.
-                enrich.prefetch_for_survey(rt.d, uid, ENRICH)
-                session["enrichments"] = enrich.resolve_for_survey(rt.d, uid, ENRICH)
-                STORE.save_session(session)
-            step = rt.start(session, quota_state(rt)) if session["page_pointer"] < 0 else rt.current_page(session, quota_state(rt))
-            STORE.save_session(session)
-            if "terminal" in step:
-                on_terminal(session, step["terminal"], rt)
-                return self._send(200, render_terminal(session, step["terminal"], rt))
-            return self._send(200, render_page(survey_id, session, step, rt))
+            with _session_lock(f"{survey_id}:{rid}:{uid}"):
+                return self._get_survey_page(survey_id, rt, query, uid, rid, theme, preview)
         self._send(404, _html("<p>Not found</p>"))
+
+    def _get_survey_page(self, survey_id, live_rt, query, uid, rid, theme, preview):
+        """GET /s/<id> after the lifecycle + signature gates: create or resume the session (the invite
+        link is the capability that yields the session's submit token), on its pinned version."""
+        rt = live_rt
+        session, created = STORE.get_or_create_session(
+            survey_id, rid, uid,
+            lambda: dict(rt.new_session(f"{survey_id}:{rid}:{uid}", query,
+                                        response_id=_mint_response_id()),
+                         date_started=now_iso(), token=_new_session_token(),
+                         **({"preview": True} if preview else {})))
+        if not created:                             # resume on the version the session started on
+            rt = rt_for_session(survey_id, session, live_rt)
+            if rt is None:
+                rt = live_rt
+                if session.get("status") not in TERMINAL_STATUSES:
+                    # The pinned definition is gone: never continue its answers on different content.
+                    # The invite link is the capability, so restart this take cleanly on the live
+                    # version (new response_id + token; the partial take was never recorded).
+                    log.warning("restarting in-flight session on the live version (pinned version missing)",
+                                extra={"survey_id": survey_id, "session_id": session.get("session_id"),
+                                       "version": session.get("version")})
+                    was_preview = session.get("preview")
+                    session = dict(rt.new_session(session["session_id"], query, response_id=_mint_response_id()),
+                                   date_started=now_iso(), token=_new_session_token(),
+                                   **({"preview": True} if (was_preview or preview) else {}))
+                    STORE.save_session(session)
+                    created = True
+        dirty = ensure_session_fields(session, rt)
+        if theme:  # the theme chosen on the landing page sticks to the whole session
+            session["theme"] = theme
+            dirty = True
+        if dirty:
+            STORE.save_session(session)
+        if session["status"] in TERMINAL_STATUSES:
+            if rt.retake != "multiple" and not session.get("preview"):  # default "once": a finished link is locked
+                return self._send(200, _html(_html_inner_terminal_again(), theme=session_theme(session, rt)))
+            # retake="multiple" (or a preview run): start a fresh take. The finished response was
+            # already recorded (on_terminal), so we reuse the session doc (same resume key
+            # survey:rid:uid) but mint a NEW unique response_id → a distinct response + passback.
+            # In-progress sessions are NOT touched (they resume above).
+            was_preview = session.get("preview")
+            rt = live_rt                            # a fresh take starts on the current live version
+            session = dict(rt.new_session(session["session_id"], query,
+                                          response_id=_mint_response_id()),
+                           date_started=now_iso(), token=_new_session_token())
+            if was_preview or preview:
+                session["preview"] = True
+            if theme:
+                session["theme"] = theme
+            STORE.save_session(session)
+            created = True
+        if created:
+            if _capture_client_meta():
+                session["client"] = client_meta(self.headers, self.client_address)
+            INTEGRATION.started(session)
+            # prefetch-on-start: only for respondents who actually begin. In prod this is
+            # an async warm against your warehouse/cache while the intro page renders; here static
+            # fixtures resolve instantly. Values land on the session for piping + logic.
+            enrich.prefetch_for_survey(rt.d, uid, ENRICH)
+            session["enrichments"] = enrich.resolve_for_survey(rt.d, uid, ENRICH)
+            STORE.save_session(session)
+        step = rt.start(session, quota_state(rt)) if session["page_pointer"] < 0 else rt.current_page(session, quota_state(rt))
+        STORE.save_session(session)
+        if "terminal" in step:
+            term = on_terminal(session, step["terminal"], rt)
+            return self._send(200, render_terminal(session, term, rt))
+        return self._send(200, render_page(survey_id, session, step, rt))
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -930,30 +1160,65 @@ class Handler(BaseHTTPRequestHandler):
             ok, retry = _RATE_LIMITER.allow(self._client_ip())
             if not ok:
                 return self._rate_limited(retry)
-        if parsed.path == "/chat/say":                    # conversational (chat) surface
-            length = int(self.headers.get("Content-Length", 0))
+        if parsed.path == "/chat/say":                    # conversational (chat) surface (demo/preview only)
+            if not _chat_enabled():
+                return self._send(404, json.dumps({"error": "not found"}), ctype="application/json")
             try:
-                body = json.loads(self.rfile.read(length) or b"{}")
+                raw = self._read_body(MAX_JSON_BODY_BYTES)
+            except _BodyError as e:
+                return self._body_error(e, json_body=True)
+            try:
+                body = json.loads(raw or b"{}")
             except Exception:
                 body = {}
-            return self._send(200, json.dumps(_chat_reply(body)), ctype="application/json")
+            if not isinstance(body, dict):
+                body = {}
+            code, payload = _chat_reply(body)
+            return self._send(code, json.dumps(payload), ctype="application/json")
         if not parsed.path.startswith("/s/") or not parsed.path.endswith("/submit"):
             return self._send(404, _html("<p>Not found</p>"))
         survey_id = parsed.path[3:].split("/")[0]
-        rt = load_rt(survey_id) if MULTI else RT
-        if rt is None:
+        live_rt = load_rt(survey_id) if MULTI else RT
+        if live_rt is None:
             log.warning("submit for unknown survey", extra={"survey_id": survey_id})
             return self._send(404, _html("<p>Unknown survey. Please check the link you were sent.</p>"))
-        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        try:
+            body = self._read_body(MAX_BODY_BYTES)          # capped before any allocation (413 beyond)
+        except _BodyError as e:
+            return self._body_error(e)
         form, files = parse_post(self.headers, body)
-        session = STORE.get_session_by_id(form.get("session_id", [""])[0])
+        del body
+        sid = form.get("session_id", [""])[0]
+        if not sid:
+            return self._send(400, _html("<p>Session not found — please reopen the original link you were sent.</p>"))
+        with _session_lock(sid):
+            return self._submit(survey_id, live_rt, sid, form, files)
+
+    def _submit(self, survey_id, live_rt, sid, form, files):
+        """POST /s/<id>/submit, serialized per session. Authorization: the session must belong to this
+        route's survey AND the request must carry the session's opaque submit token (rendered only on
+        pages served for the invite link). Anything else is refused without touching the session."""
+        session = STORE.get_session_by_id(sid)
         if session is None:
             return self._send(400, _html("<p>Session not found — please reopen the original link you were sent.</p>"))
+        if session.get("survey_id") != survey_id or not _token_ok(session, form.get("session_token", [""])[0]):
+            log.warning("submit refused: session/token mismatch",
+                        extra={"survey_id": survey_id, "session_id": sid})
+            return self._send(403, _html(
+                "<div class='term'><h1>Link not valid</h1><p>This page has expired. Please reopen the "
+                "original link you were sent to continue.</p></div>"))
+        rt = rt_for_session(survey_id, session, live_rt)     # the session's pinned version
+        if rt is None:
+            if session.get("status") in TERMINAL_STATUSES:
+                return self._send(200, _html(_html_inner_terminal_again(), theme=session_theme(session, live_rt)))
+            return self._send(409, _html(_SURVEY_UPDATED_HTML, theme=session_theme(session, live_rt)))
         if session.get("status") in TERMINAL_STATUSES:
             # Already finished (completed / screened-out / over-quota). Refuse to reprocess — this is
             # what stops a respondent hitting Back to the screen-out page and changing the answer to
             # get past it. No answers change, no passback re-fires.
             return self._send(200, _html(_html_inner_terminal_again(), theme=session_theme(session, rt)))
+        if ensure_session_fields(session, rt):               # (token exists; backfills passback_vars)
+            STORE.save_session(session)
         page_id = form.get("page_id", [""])[0]
         if _capture_client_meta():                            # client JS fingerprint (first submit only)
             fp = _parse_fingerprint(form.get("__fp", [""])[0])
@@ -961,7 +1226,7 @@ class Handler(BaseHTTPRequestHandler):
                 session.setdefault("client", {})["fingerprint"] = fp
         raw_answers, grid = {}, {}
         for key, values in form.items():
-            if key in ("session_id", "page_id", "__fp"):
+            if key in ("session_id", "session_token", "page_id", "__fp"):
                 continue
             if "::" in key:                                   # grid cell: "qid::rowid"
                 qid, rid = key.split("::", 1)
@@ -969,43 +1234,73 @@ class Handler(BaseHTTPRequestHandler):
                 grid.setdefault(qid, {})[rid] = values if checkbox_grid else values[0]
                 continue
             q = rt.questions_by_id.get(key, {})
+            if q.get("type") == "file":                       # file answers come only from real uploads
+                continue
             raw_answers[key] = values if q.get("type") in ("checkbox", "ranking", "dropdown_multi") else values[0]
         raw_answers.update(grid)                              # grid answers are {row_id: col_value} dicts
-        for qid, flist in files.items():                     # `file` questions: store bytes, keep a reference
-            if rt.questions_by_id.get(qid, {}).get("type") != "file":
-                continue
-            us = upload_store()
-            refs = [us.put(survey_id, session.get("session_id"), qid, fn, data, content_type=ct)
-                    for (fn, ct, data) in flist if fn and data]
-            if refs:
-                multi = (rt.questions_by_id.get(qid, {}).get("validation", {}).get("max_files") or 1) > 1
-                raw_answers[qid] = refs if multi else refs[0]
-        step = rt.submit(session, page_id, raw_answers, quota_state(rt))
-        STORE.save_session(session)
+        qstate = quota_state(rt)
+        stored = self._store_uploads(survey_id, session, rt, page_id, files, raw_answers, qstate)
+        step = rt.submit(session, page_id, raw_answers, qstate)
+        # bytes stored for an answer that wasn't accepted (validation errors / stale page) are removed
+        for key, refs in stored.items():
+            if session.get("answers", {}).get(key) != raw_answers.get(key):
+                _delete_uploads(refs)
         for hook in step.get("webhooks", []):    # deliver any webhook-action intents
             from survey_agent.integrations.webhook import deliver
             ok = _OUTBOX.deliver_or_enqueue(hook, deliver) if _OUTBOX else deliver(hook)
             if not ok:
                 log.warning("webhook delivery failed%s", " — queued for retry" if _OUTBOX else "",
-                            extra={"survey_id": survey_id, "url": hook.get("url")})
+                            extra={"survey_id": survey_id, "url": obs.redact_url(hook.get("url"))})
         if "terminal" in step:
-            on_terminal(session, step["terminal"], rt)
-            dest = terminal_destination(session, step["terminal"])
+            term = on_terminal(session, step["terminal"], rt)   # saves the session
+            dest = terminal_destination(session, term)
             if dest:                                          # browser-redirect passback (complete + screen-out)
                 return self._redirect(dest)
-            return self._send(200, render_terminal(session, step["terminal"], rt))
+            return self._send(200, render_terminal(session, term, rt))
+        STORE.save_session(session)
         return self._send(200, render_page(survey_id, session, step, rt))
+
+    def _store_uploads(self, survey_id, session, rt, page_id, files, raw_answers, qstate):
+        """Validate, then persist, the multipart files for `file` questions displayed on the session's
+        current page. Nothing is stored for a stale page, a question not on screen, or an upload that
+        breaks the question's count/extension/size rules — those become plain metadata stubs so
+        submit() re-renders with the right error. Returns {answer_key: [stored refs]}."""
+        eligible = rt.file_questions_for_submit(session, page_id, qstate) if files else {}
+        stored = {}
+        for key, flist in files.items():
+            q = eligible.get(key)
+            picked = [(fn, ct, data) for (fn, ct, data) in flist if fn and data]
+            if q is None or not picked:
+                continue
+            multi = ((q.get("validation") or {}).get("max_files") or 1) > 1
+            stubs = [{"filename": fn, "size": len(data), "content_type": ct} for (fn, ct, data) in picked]
+            if rt.file_upload_error(q, stubs):
+                raw_answers[key] = stubs if multi else (stubs[0] if len(stubs) == 1 else stubs)
+                continue
+            us = upload_store()
+            refs = []
+            try:
+                for (fn, ct, data) in picked:
+                    refs.append(us.put(survey_id, session.get("response_id") or session.get("session_id"),
+                                       key, fn, data, content_type=ct))
+            except Exception:
+                _delete_uploads(refs)
+                raise
+            stored[key] = refs
+            raw_answers[key] = refs if multi else refs[0]
+        return stored
 
     def _api_responses(self, path, query):
         """Token-gated data export: GET /api/responses[/<survey_id>][?format=csv]. The shared secret
-        (SURVEY_API_TOKEN) is required via `Authorization: Bearer <t>` or `?token=`; unset ⇒ disabled."""
+        (SURVEY_API_TOKEN) is required via the `Authorization: Bearer <t>` header only — never a query
+        param (URLs end up in history, proxies and access logs); unset ⇒ disabled."""
         if not API_TOKEN:
             return self._send(503, json.dumps({"result_ok": False,
                               "error": "data API disabled — set SURVEY_API_TOKEN to enable"}),
                               ctype="application/json")
         import hmac as _hmac
         auth = self.headers.get("Authorization", "")
-        tok = auth[7:] if auth.startswith("Bearer ") else query.get("token", "")
+        tok = auth[7:] if auth.startswith("Bearer ") else ""
         if not _hmac.compare_digest(tok or "", API_TOKEN):
             return self._send(401, json.dumps({"result_ok": False, "error": "unauthorized"}),
                               ctype="application/json")
@@ -1024,46 +1319,98 @@ def _html_inner_terminal_again():
 
 # ----------------------------------------------------------------- conversational (chat) surface
 # The SAME survey, delivered as a chat in the browser — the showcase for conversational mode +
-# adaptive probing. State is per-browser, in-process (fine for a demo / single instance).
-_CHATS = {}
+# adaptive probing. It is a DEMO / PREVIEW surface only: it uses demo identities and in-memory quota
+# state and records nothing, so it is served only in demo/preview mode (SURVEY_SERVE_STATES=* — what
+# `survey-agent demo` / `serve --preview` set — or an explicit SURVEY_CHAT_DEMO=1). State is
+# per-browser, in-process, and bounded (LRU + idle TTL).
+_CHATS = OrderedDict()          # chat id -> (survey_id, Conversation, last_used_monotonic)
+_CHATS_LOCK = threading.Lock()
+_CHATS_MAX = 500
+_CHATS_TTL = 3600               # seconds a chat may sit idle before it is dropped
+
+
+def _chat_enabled():
+    return _serve_all_states() or (os.environ.get("SURVEY_CHAT_DEMO") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _chat_gate(survey_id, query):
+    """The same lifecycle gate as the form (paused/closed/not-open), for GET /chat AND every POST
+    /chat/say. Returns a refusal page (HTML) or None when the chat may proceed."""
+    if _serve_all_states():
+        return None
+    st = _survey_state(survey_id)
+    if st in ("paused", "closed"):
+        return _closed_page(st, theme=query.get("theme"))
+    if st is not None and st not in _serve_states() and not _preview_ok(query):
+        return _not_open_page(theme=query.get("theme"))
+    return None
+
+
+def _chats_prune(now):
+    for chat_id in [k for k, (_, _, t) in _CHATS.items() if now - t > _CHATS_TTL]:
+        _CHATS.pop(chat_id, None)
+    while len(_CHATS) > _CHATS_MAX:
+        _CHATS.popitem(last=False)              # least recently used
 
 
 def _chat_reply(body):
-    """Drive a per-browser Conversation. With no/unknown session_id, start fresh (resolving demo
-    behavioral enrichment for a uid that has history, so the adaptive-probe page can appear) and
-    return the opening; otherwise feed the reply and return the next message (or the terminal).
-    In multi-survey mode the client passes `survey` (the id) so we drive the right survey."""
+    """Drive a per-browser Conversation. Returns (http_code, payload). With no/unknown session_id,
+    start fresh (resolving demo behavioral enrichment for a uid that has history, so the adaptive-probe
+    page can appear) and return the opening; otherwise feed the reply and return the next message (or
+    the terminal). In multi-survey mode the client passes `survey` (the id) so we drive the right
+    survey. The lifecycle gate is re-checked on every call. Nothing is recorded (preview)."""
     import uuid
     from survey_agent.conversation import Conversation
-    rt = (load_rt(body.get("survey")) if MULTI else RT) or RT
     sid = body.get("session_id")
-    convo = _CHATS.get(sid)
-    if convo is None:
+    gate_q = {"preview": body.get("preview")} if body.get("preview") else {}
+    now = time.monotonic()
+    with _CHATS_LOCK:
+        _chats_prune(now)
+        entry = _CHATS.get(sid) if isinstance(sid, str) else None
+        if entry is not None:
+            _CHATS.move_to_end(sid)
+            _CHATS[sid] = (entry[0], entry[1], now)
+    if entry is None:
+        survey_id = body.get("survey") if MULTI else (RT.d["id"] if RT else None)
+        rt = load_rt(survey_id) if MULTI else RT
         if rt is None:
-            return {"session_id": None, "message": "No survey selected — open /chat?survey=<id>.", "done": True}
+            return 404, {"session_id": None, "message": "No survey selected — open /chat?survey=<id>.", "done": True}
+        if _chat_gate(survey_id, gate_q):
+            return 403, {"session_id": None, "message": "This survey isn't open right now.", "done": True}
         try:
             enr = enrich.resolve_for_survey(rt.d, "1001", ENRICH)
         except Exception:
             enr = {}
         convo = Conversation(rt.d, url_vars={rt.respondent_var: "1001", rt.response_var: "1",
                                              "group": "demo", "lang": "en"}, enrichments=enr)
-        sid = "c" + uuid.uuid4().hex[:10]
-        _CHATS[sid] = convo
+        sid = "c" + uuid.uuid4().hex[:16]
+        with _CHATS_LOCK:
+            _CHATS[sid] = (survey_id, convo, now)
+            _chats_prune(now)
         out = convo.opening()
-        return {"session_id": sid, "message": out["message"], "done": bool(out.get("done"))}
-    out = convo.reply(body.get("reply", ""))
-    resp = {"session_id": sid, "message": out["message"], "done": bool(out.get("done"))}
+        return 200, {"session_id": sid, "message": out["message"], "done": bool(out.get("done")), "preview": True}
+    survey_id, convo, _ = entry
+    if _chat_gate(survey_id, gate_q):
+        with _CHATS_LOCK:
+            _CHATS.pop(sid, None)
+        return 403, {"session_id": None, "message": "This survey isn't open right now.", "done": True}
+    reply = body.get("reply", "")
+    out = convo.reply(reply if isinstance(reply, str) else str(reply))
+    resp = {"session_id": sid, "message": out["message"], "done": bool(out.get("done")), "preview": True}
     if out.get("done"):
         resp["status"] = out.get("status")
-        _CHATS.pop(sid, None)
-    return resp
+        with _CHATS_LOCK:
+            _CHATS.pop(sid, None)
+    return 200, resp
 
 
-def chat_page(theme=None, rt=None, survey_id=None):
+def chat_page(theme=None, rt=None, survey_id=None, preview=None):
     rt = rt or RT
-    _survey_js = json.dumps(survey_id or (rt.d["id"] if rt else None))
+    _survey_js = json.dumps(survey_id or (rt.d["id"] if rt else None)).replace("<", "\\u003c")
+    _preview_js = json.dumps(preview or None).replace("<", "\\u003c")
     body = (
         '<div class="q" style="max-width:640px;margin:0 auto">'
+        '<p class="meta" style="font-weight:600">Preview — responses are not recorded.</p>'
         f'<h1>{escape(rt.d["title"])} — as a conversation</h1>'
         '<p class="meta">The <b>same survey</b>, delivered as a chat. The engine still owns every '
         'branch, screen-out and quota; the AI only phrases each question, reads your free-text reply, '
@@ -1075,7 +1422,7 @@ def chat_page(theme=None, rt=None, survey_id=None):
         '<button id="b" disabled>Send</button></div></form>'
         '<p class="meta"><a href="/">← back to the form demo</a></p></div>')
     js = """<script>
-    var SID=null, SURVEY=__SURVEY__;
+    var SID=null, SURVEY=__SURVEY__, PREVIEW=__PREVIEW__;
     function add(who,txt){var d=document.createElement('div');d.style.margin='8px 0';
       d.style.whiteSpace='pre-wrap';var s=document.createElement('b');s.textContent=who+': ';
       d.appendChild(s);d.appendChild(document.createTextNode(txt));
@@ -1084,15 +1431,15 @@ def chat_page(theme=None, rt=None, survey_id=None):
       m.disabled=on;b.disabled=on;if(!on)m.focus();}
     async function post(reply){
       var r=await fetch('/chat/say',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({session_id:SID,survey:SURVEY,reply:reply})});
+        body:JSON.stringify({session_id:SID,survey:SURVEY,preview:PREVIEW,reply:reply})});
       var j=await r.json();SID=j.session_id;add('Survey',j.message);
       if(j.done){lock(true);document.getElementById('m').placeholder='[ '+(j.status||'done')+' ]';}
       else lock(false);}
     function say(){var m=document.getElementById('m'),t=m.value.trim();if(!t)return false;
       add('You',t);m.value='';lock(true);post(t);return false;}
     post('');
-    </script>""".replace("__SURVEY__", _survey_js)
-    return _html(body + js, "Chat — survey-agent", theme)
+    </script>""".replace("__SURVEY__", _survey_js).replace("__PREVIEW__", _preview_js)
+    return _html(body + js, "Chat preview — survey-agent", theme)
 
 
 def _responses_csv(rows):

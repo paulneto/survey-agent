@@ -116,9 +116,22 @@ def live_server(tmp_path):
         recv.shutdown()
 
 
+_TOKENS = {}
+
+
+def _open(base, sid, uid, rid):
+    """GET the invite link (creates/resumes the session) and remember the rendered submit token."""
+    import re
+    with urllib.request.urlopen(f"{base}/s/{sid}?uid={uid}&rid={rid}", timeout=5) as r:
+        html = r.read().decode()
+        _TOKENS[(sid, rid, uid)] = re.search(r'name=session_token value="([^"]+)"', html).group(1)
+        return r.status
+
+
 def _submit(base, sid, page_id, rid, uid, answers):
     op = urllib.request.build_opener(_NoRedirect)
-    data = urllib.parse.urlencode({"session_id": f"{sid}:{rid}:{uid}", "page_id": page_id, **answers}).encode()
+    data = urllib.parse.urlencode({"session_id": f"{sid}:{rid}:{uid}", "session_token": _TOKENS[(sid, rid, uid)],
+                                   "page_id": page_id, **answers}).encode()
     req = urllib.request.Request(f"{base}/s/{sid}/submit", data=data, method="POST",
                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
@@ -134,12 +147,12 @@ def test_http_lifecycle_complete_and_screenout(live_server):
     sid = "e2e-http"
 
     # Respondent 1 — qualifies → completes (GET creates the session, then walk the pages).
-    assert urllib.request.urlopen(f"{base}/s/{sid}?uid=U1&rid=R1", timeout=5).status == 200
+    assert _open(base, sid, "U1", "R1") == 200
     assert _submit(base, sid, "p1", "R1", "U1", {"q_consent": "yes", "q_age": "30"}) in (200, 302)
     assert _submit(base, sid, "p2", "R1", "U1", {"q_channel": "web"}) in (200, 302)
 
     # Respondent 2 — declines consent → screened out.
-    urllib.request.urlopen(f"{base}/s/{sid}?uid=U2&rid=R2", timeout=5)
+    _open(base, sid, "U2", "R2")
     assert _submit(base, sid, "p1", "R2", "U2", {"q_consent": "no", "q_age": "40"}) in (200, 302)
 
     # --- persistence (poll briefly; the write lands just before the passback) ---

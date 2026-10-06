@@ -29,7 +29,7 @@ A survey moves through clear stages. Each stage names *who* does it — **consol
 4. **Approve** *(human)*. The **mandatory** sign-off before fielding real people. When
    `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, no surface (CLI, console, or MCP connector) can mark a survey
    live without that token. When it is unset, the local CLI and console can mark live; the MCP
-   connector still cannot.
+   connector and the API gateway still cannot.
 5. **Publish + mark live** *(console or CLI)*. In the console: open the survey → **Mark live** (in a
    token-gated deployment, supply the approval token). With a runtime definition store
    (`SURVEY_DEFINITION_SOURCE=mongo` or `http`) that's a store write — **live, no redeploy**. With the `file` backend, `publish` / `git push` deploys it. The board's status light goes
@@ -136,7 +136,7 @@ commands** (in Claude Code / the connector); **CLI commands are `survey-agent <c
 - **Preview:** `serve --multi` (or `serve --survey <file>`) · `convo --survey <file>` · `console` (this UI) · `demo` (clickable demo + webhook receiver).
 - **Launch & publish:** `launch <file>` `[--base · --no-live · --deploy · --approve TOKEN · --ack-responsibilities]` · `publish <file>` (runtime store — live, no redeploy) · `sign-url <file> uid=… rid=…` (signed per-respondent link).
 - **Lifecycle:** `status <id>` (show) · `status <id> --set live|paused|closed|approved [--url] [--note]` (set) · `status <id> --project "<name>"` (move to a project; `--project ""` ungroups) · `list [--json]` (all surveys + state).
-- **Data subject requests:** `dsar <uid> [--survey ID] [--delete --yes]` (find, and optionally erase, a respondent's responses in the configured store).
+- **Data subject requests:** `dsar <id> [--survey ID] [--delete --yes]` (find, and optionally erase, a respondent's responses, sessions, uploads and queued webhook deliveries).
 - **Definitions (store ⇄ files):** `defs-export [--all]` · `defs-import` · `defs-diff`.
 - **Report & data:** `report <file> [--simulate N --open]` · `insights <file>` · `export <file> [--format csv|parquet]` · `dashboard [--live --reports]`.
 - **Project:** `init [dir]` (scaffold config + `.env` + example) · `templates` (list) · `doctor` (check install/config) · `help`.

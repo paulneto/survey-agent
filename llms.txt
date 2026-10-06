@@ -7,9 +7,9 @@
 > pluggable integration. You own the data, you bring your own LLM, and it runs anywhere.
 
 survey-agent is built to be **driven by LLMs like Claude** and **self-hosted by the deployer**. The
-engine depends only on the standard library plus `jsonschema` and `PyYAML`; everything else is an
-optional extra. Storage, panel/CRM passback, enrichment, and the LLM are swappable seams. Mongo,
-Render, Firebolt, and Mailchimp appear in this repo only as *reference implementations* of those
+engine depends only on the standard library plus `jsonschema`, `PyYAML` and `regex`; everything
+else is an optional extra. Storage, panel/CRM passback, enrichment, and the LLM are swappable seams.
+Mongo, Render, Firebolt, and Mailchimp appear in this repo only as *reference implementations* of those
 seams, never as requirements. Version 0.1.0; the PyPI package ships with the first release, and until
 then it installs from GitHub (`pip install "git+https://github.com/paulneto/survey-agent"`).
 
@@ -24,7 +24,7 @@ then it installs from GitHub (`pip install "git+https://github.com/paulneto/surv
 ## Drive it as an agent
 
 - MCP connector: `claude mcp add survey-agent -- uvx --from "survey-agent[mcp,llm]" survey-agent-mcp`. It exposes the loop as typed tools (`save_survey`, `validate_survey`, `simulate_survey`, `critique_survey`, `pretest_survey`, `launch_survey`, `list_surveys`, `survey_report`, …) plus `begin_survey`/`answer_survey` for collecting structured answers from a human mid-task
-- Launch gate: when `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, no surface can mark a survey live without that human-supplied token; when it is unset, the local CLI and console can, and the MCP connector cannot
+- Launch gate: when `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, no surface can mark a survey live without that human-supplied token; when it is unset, the local CLI and console can, and the MCP connector and API gateway cannot
 - Host capabilities: [docs/AGENT_HOSTS.md](https://github.com/paulneto/survey-agent/blob/main/docs/AGENT_HOSTS.md): which hosts can drive it (Claude Code / Claude desktop / claude.ai / ChatGPT / Codex) and what each can and cannot do
 - Skills: [skills/](https://github.com/paulneto/survey-agent/tree/main/skills): the authoring workflow for Claude Code (author-survey, edit-survey, add-logic, test-survey, launch-survey, survey-report, inline-survey)
 - CLI: `survey-agent help` (one command per step); most read/check commands take `--json`

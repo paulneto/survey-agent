@@ -26,7 +26,8 @@ Marking a survey live means real people can take it, so it is gated:
   `--ack-responsibilities` (or `SURVEY_OPERATOR_ACK=1` for a deployment with standing sign-off). Over
   MCP, `launch_survey` takes `approval_token` and `acknowledge_responsibilities=true`.
 - **When it is unset**, a human at the local CLI or console can mark a survey live. The MCP connector
-  still can't: it always requires the token.
+  and the API gateway still can't: they always require the token. (A CLI pointed at a gateway with
+  `SURVEY_DEFINITION_SOURCE=http` forwards the `--approve` token it verified.)
 
 You always get the `survey_url`. Only flipping the survey to `live` is gated. Never pass the token on
 the human's behalf; show them the checklist and let them supply it.
@@ -60,8 +61,10 @@ the human's behalf; show them the checklist and let them supply it.
    system sends. If the parameters must not be forgeable, set `settings.url_signing.required` and mint
    per-respondent links with `survey-agent sign-url surveys/<slug>.survey.json uid=… rid=…`
    (signed with `SURVEY_URL_SECRET`).
-4. **Freeze the version:** commit the `.survey.json`. Definitions are immutable and versioned;
-   in-flight respondents stay pinned to the version they started.
+4. **Freeze the version:** commit the `.survey.json` and `surveys/.versions/` (the immutable
+   version snapshots; `survey-agent publish` writes them). Definitions are immutable and versioned;
+   in-flight respondents stay pinned to the version they started, as long as the deployed runtime
+   has that version's snapshot.
 5. Hand off to `survey-report` for monitoring.
 
 ## Optional: telling your system what happened

@@ -179,7 +179,8 @@ survey-agent serve --preview --multi --dir surveys --port 8000
 ```
 Open both surfaces and actually take it:
 - **Form:** http://localhost:8000/s/ai-at-work
-- **Conversation:** http://localhost:8000/chat?survey=ai-at-work  (same survey, as a chat)
+- **Conversation:** http://localhost:8000/chat?survey=ai-at-work  (same survey, as a chat; a preview
+  that records nothing)
 
 Try the paths on purpose: answer **"No"** to Q1 → you should hit the **disqualified** screen; answer
 **"weekly"** → you should see the tools + time-saved pages with your tool piped in. `Ctrl-C` to stop.
@@ -203,20 +204,27 @@ This prints the drop-in `survey_url` and records `live` in `surveys/.registry.js
 local bookkeeping — it does **not** publish. The approval gate:
 
 - If your deployment sets `SURVEY_LAUNCH_APPROVAL_TOKEN`, nothing (CLI `launch` / `status --set live` /
-  `publish`, the console, or MCP) marks a survey live without the token: a human runs
+  `publish`, the console, MCP, or the API gateway) marks a survey live without the token: a human runs
   `survey-agent launch … --approve <token> --ack-responsibilities` (or sets `SURVEY_OPERATOR_ACK=1`
   for standing sign-off of the [operator checklist](OPERATOR_RESPONSIBILITIES.md)).
-- If it is unset, the local CLI and console can mark live directly (the MCP connector still can't), so
-  make your PR review the approval step.
+- If it is unset, the local CLI and console can mark live directly (the MCP connector and the API
+  gateway still can't), so make your PR review the approval step.
 
 **2. Publish it.** With file-based definitions (the default), publishing is a deploy:
 
 ```bash
-git add surveys/ai-at-work.survey.json surveys/ai-at-work.md surveys/.registry.json
+git add surveys/ai-at-work.survey.json surveys/ai-at-work.md
+git add surveys/.versions                # immutable version snapshots (see Step 8)
+git add -f surveys/.registry.json        # lifecycle state; gitignored by default, so force-add it
 git commit -m "Add AI-at-Work screener"
 git push -u origin survey/ai-at-work
 gh pr create --fill          # a teammate reviews → merges to main
 ```
+
+`surveys/.versions/` appears once the survey has been published (`survey-agent publish`) or served
+locally (Step 4); skip that line if it isn't there yet. `./deploy.sh "msg"` stages all three for you
+and refuses to commit anything outside `surveys/`, `templates/` and `triggers/` (override the list
+with `DEPLOY_PATHS`).
 
 Merge to `main` → **the host redeploys** → your survey is **live** (make auto-deploy reliable with the
 deploy-hook setup in [Appendix A](#appendix-a--one-time-setup-the-service)):
@@ -227,7 +235,9 @@ https://my-surveys.onrender.com/s/ai-at-work
 
 That's the drop-in link — put it in your panel, email, or CRM. Every query parameter you append
 (`?uid=…&rid=…&group=…`, or whatever names your panel sends) is captured into `url_variables` so you
-can tie responses back to people. If a parameter affects eligibility, quota, routing, or payment, mint
+can tie responses back to people. The link is also how a respondent resumes: reopening it continues
+their session, and each page carries a per-session token that a submit must match. If a parameter
+affects eligibility, quota, routing, or payment, mint
 **signed** per-respondent links instead:
 
 ```bash
@@ -299,8 +309,9 @@ A repeated question (asked once per tool, say) has one `survey_data` entry per i
 `qid[item]` (`freq[chatgpt]`) with an extra `repeat: {source, value, label}`, and one CSV column per
 item in the source question's option order.
 
-The `?token=` query form works too if a header is awkward. **With `SURVEY_API_TOKEN` unset the
-endpoint is disabled (503); a missing or wrong token gets 401.** Exports are not redacted — treat the
+The token is accepted only in the `Authorization` header (never as a query parameter, which would end
+up in logs and browser history). **With `SURVEY_API_TOKEN` unset the endpoint is disabled (503); a
+missing or wrong token gets 401.** Exports are not redacted — treat the
 token like database credentials.
 
 ### Pulling from the store directly (Mongo example)
@@ -368,6 +379,20 @@ git commit -am "ai-at-work: add follow-up on budget" && git push    # PR → mer
 ```
 Definitions are **immutable + versioned**: respondents already mid-survey stay on the version they
 started; new respondents get the new one.
+
+- **Where versions live (file definitions).** Each version is kept as a read-only snapshot at
+  `surveys/.versions/<id>/v<N>.survey.json`. `survey-agent publish` writes it, and so does the
+  runtime the first time it serves a new version. Commit `surveys/.versions/` with the survey so the
+  redeployed runtime still has the version in-progress respondents started on (`./deploy.sh` stages
+  it, and the Docker build context includes it). A database definition source (`mongo`) keeps every
+  version in the store.
+- **Version numbers follow the content.** The same content keeps its version. Changed content never
+  reuses a number: if you edit without bumping `version` (or reuse an old number), it gets the next
+  one, and `publish` writes that number back into the file. An explicit higher bump is kept with the
+  file backend; `mongo` always takes the next number.
+- **If a respondent's version is gone** (say `.versions/` wasn't deployed), their next submit shows
+  *"This survey was updated"* and asks them to reopen their link. Opening the invitation link again
+  restarts them on the live version; the unfinished take is not recorded.
 
 ---
 
@@ -540,6 +565,9 @@ reviewed deploy).
 >
 > **Manual / local one-shot:** [`deploy.sh`](../deploy.sh) ships in the repo — `./deploy.sh "msg"` does
 > commit + push, and if `RENDER_DEPLOY_HOOK` is set (e.g. in `.env`) it also pings the hook directly.
+> It stages only definition paths (`surveys/`, `templates/`, `triggers/`, plus the gitignored
+> `surveys/.registry.json`; override with `DEPLOY_PATHS`) and refuses to commit if anything else is
+> staged, so respondent data or `.env` files lying in the working tree never go out with a deploy.
 > Any deploy command can also be wired to `survey-agent launch --deploy`:
 > ```yaml
 > # survey-agent.config.yaml
@@ -558,8 +586,9 @@ reviewed deploy).
 - **Skills** (repo `skills/`): `/author-survey /edit-survey /add-logic /test-survey /launch-survey
   /survey-report /inline-survey`.
 - **CLI:** see [Appendix C](#appendix-c--command-cheat-sheet), or `survey-agent help`.
-- **Service URLs:** `/` holding page · `/s/<slug>?uid=&rid=&group=` · `/chat?survey=<slug>` · `/health` ·
-  `/api/responses[/<slug>][?format=csv]` (token via `Authorization: Bearer <token>` or `?token=`).
+- **Service URLs:** `/` holding page · `/s/<slug>?uid=&rid=&group=` · `/health` ·
+  `/api/responses[/<slug>][?format=csv]` (token via the `Authorization: Bearer <token>` header) ·
+  `/chat?survey=<slug>` (preview only — see below).
 - **Storage — flat files by default, a database when you need one:** unset `SURVEY_STORE` = `file` →
   `<SURVEY_DATA_DIR>/responses/<slug>.jsonl` (default `./survey_data`); switch with one env var:
   `SURVEY_STORE=sqlite`, `SURVEY_STORE=mongo` + `SURVEY_MONGODB_URI=…`, or your own
@@ -632,7 +661,7 @@ for the full flags of any command.
 | `survey-agent export <survey> [--format csv\|parquet] [--out …]` | Raw responses for your own BI tooling (not redacted). |
 | `survey-agent backup [--survey ID] [--out F]` / `restore <file>` | Portable JSONL backup of stored responses / reload into any store. |
 | `survey-agent defs-export [--all]` / `defs-import` / `defs-diff` | Back up, rebuild, and reconcile a runtime definition store. |
-| `survey-agent dsar <uid> [--survey ID] [--delete] [--yes] [--json]` | Find a subject's responses; `--delete` erases them from the store. |
+| `survey-agent dsar <id> [--survey ID] [--id-field VAR] [--delete] [--yes] [--json [--full]]` | Find a subject's responses and sessions (`--json --full` = the access copy); `--delete` erases them plus their uploads and queued webhook deliveries. |
 | `survey-agent outbox status\|list\|retry [--dead]` | Inspect/retry the durable outbox for webhook actions (`SURVEY_OUTBOX=1`). |
 | `survey-agent docs [name] [--open]` | List or open the bundled docs. |
 | `survey-agent help` | Guided overview of the commands + the author→launch→report flow. |
@@ -646,9 +675,9 @@ for the full flags of any command.
 |---|---|
 | `GET /` | Holding page (lists surveys only with `SURVEY_LANDING_LIST=1`). |
 | `GET /s/<id>?uid=&rid=&group=&lang=` | The drop-in survey page; all query params → `url_variables`. |
-| `GET /chat?survey=<id>` | The conversational surface for a survey. |
+| `GET /chat?survey=<id>` | Chat preview of a survey. Served only in demo/preview mode (`demo`, `serve --preview`) or with `SURVEY_CHAT_DEMO=1`; responses are not recorded. |
 | `GET /health` | `{"ok": true}` — uptime/health check. |
-| `GET /api/responses[/<id>][?format=csv]` | Token-gated data pull (`Authorization: Bearer <token>` or `?token=`); disabled until `SURVEY_API_TOKEN` is set. |
+| `GET /api/responses[/<id>][?format=csv]` | Token-gated data pull (`Authorization: Bearer <token>` header only); disabled until `SURVEY_API_TOKEN` is set. |
 | `GET /manage` | Management console — opt-in `SURVEY_CONSOLE=1`, **unauthenticated**. |
 
 ### Key environment variables
@@ -665,7 +694,10 @@ for the full flags of any command.
 | `SURVEY_DIR` | Surveys folder served by `--multi`. |
 | `SURVEY_SERVE_STATES` | Lifecycle states served to respondents (default `live`). |
 | `SURVEY_PREVIEW_TOKEN` | Enables operator preview of pre-live surveys via `?preview=<token>`. |
-| `SURVEY_API_TOKEN` | Gates `/api/responses` (unset → the endpoint is disabled); also the gateway's bearer token. |
+| `SURVEY_API_TOKEN` | Gates `/api/responses` (unset → the endpoint is disabled; sent in the `Authorization: Bearer` header); also the gateway's bearer token. |
+| `SURVEY_MAX_BODY_BYTES` | Largest request body the runtime accepts (default 10 MB; larger → 413). |
+| `SURVEY_REQUEST_TIMEOUT` | Per-connection socket timeout in seconds (default 30). |
+| `SURVEY_CHAT_DEMO` | `1` = serve the `/chat` preview outside demo/preview mode (it records nothing). |
 | `SURVEY_PUBLIC_BASE_URL` | Optional override for the public base in emitted URLs (otherwise derived from the host; `doctor` shows it). |
 | `SURVEY_LAUNCH_APPROVAL_TOKEN` | When set, marking live on any surface requires this token. |
 | `SURVEY_URL_SECRET` | HMAC secret for signed respondent URLs (`sign-url` + runtime verification). |
@@ -708,12 +740,14 @@ A generic, reference server-to-server passback: select the `panel` integration a
 | `terminated` | disqualify **or** over-quota | `SURVEY_PANEL_TERMINATED_URL` |
 | `terminated_by_user` | respondent abandons — **not fired by the stdlib runtime** (it has no abandon detection); available to custom hosts | `SURVEY_PANEL_TERMINATED_BY_USER_URL` |
 
-Each call POSTs the neutral event — it carries `url_variables` (so whatever ids your panel put on the
-link ride along), the response's reason code, a stable `idempotency_key` for dedupe under retry, and
-an `X-Survey-Signature` HMAC over the body keyed by `SURVEY_PANEL_SHARED_SECRET`. Leave a URL blank to
-skip that event; set `SURVEY_PANEL_CALLBACK_METHOD=GET` to send the event as a query string instead.
-Passbacks are best-effort (the outbox does not cover them); reconcile against the store if a lost
-callback matters. The endpoint URLs are config — no panel/vendor name lives in the engine.
+Each call POSTs the neutral event — it carries `url_variables` (the ids your panel put on the link
+that the survey declares in `settings.url_variables`, plus the identity variables; undeclared params
+are stored on the response but not forwarded), the response's reason code, a stable `idempotency_key`
+for dedupe under retry, and an `X-Survey-Signature` HMAC over the body keyed by
+`SURVEY_PANEL_SHARED_SECRET`. Leave a URL blank to skip that event; set
+`SURVEY_PANEL_CALLBACK_METHOD=GET` to send the event as a query string instead. Passbacks are
+best-effort (the outbox does not cover them); reconcile against the store if a lost callback matters.
+The endpoint URLs are config — no panel/vendor name lives in the engine.
 
 #### Where definitions live (`SURVEY_DEFINITION_SOURCE`)
 By default (`file`) survey definitions are `.survey.json` files in `SURVEY_DIR` and lifecycle is the

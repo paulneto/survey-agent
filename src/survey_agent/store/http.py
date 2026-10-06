@@ -32,7 +32,11 @@ class HTTPStore:
             raise
 
     # ---- read side (control plane) ----
-    def list_responses(self, survey_id=None, uid=None):
+    def list_responses(self, survey_id=None, uid=None, id_fields=None):
+        from . import norm_id_fields
+        if norm_id_fields(id_fields) != ("uid",):
+            raise NotImplementedError("SURVEY_STORE=http can only match a respondent on url var `uid`; "
+                                      "run DSAR against the runtime's direct store")
         if not survey_id:
             raise NotImplementedError("SURVEY_STORE=http requires a survey_id to list responses")
         q = f"?uid={urllib.parse.quote(str(uid))}" if uid is not None else ""
@@ -51,4 +55,6 @@ class HTTPStore:
             "store (SURVEY_STORE=mongo/file) — it writes sessions/quotas/responses on the hot path.")
 
     get_or_create_session = save_session = get_session_by_id = _read_only
-    record_response = incr_quota = quota_counts = _read_only
+    record_response = incr_quota = quota_counts = reserve_quotas = _read_only
+    # DSAR access/erasure needs sessions + every survey — the runtime's direct store, not the gateway.
+    find_respondent = erase_respondent = delete_responses = _read_only

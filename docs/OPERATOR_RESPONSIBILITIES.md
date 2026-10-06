@@ -20,11 +20,12 @@ runtime serves it — see [DEPLOY.md](DEPLOY.md).
   restart. There, use a database (the reference `mongo` store, or your own store plugin). `sqlite`
   suits several workers on one box. The `memory` store is for tests only. `survey-agent backup` /
   `restore` give you a portable copy of stored responses. See [HOSTING.md](HOSTING.md).
-- **☐ Erasure / DSAR.** You must be able to find and delete a subject's responses.
-  `survey-agent dsar <uid>` lists them and `survey-agent dsar <uid> --delete` erases them from the
-  configured store (every built-in store implements `delete_responses`; a custom store must too).
-  Copies outside the store — exports, backups, webhook/CRM/panel receivers, your warehouse — are yours
-  to clear. Decide your retention policy before you collect anything.
+- **☐ Erasure / DSAR.** You must be able to find and delete a subject's data. `survey-agent dsar <id>`
+  lists their responses and sessions, and `survey-agent dsar <id> --delete` erases those plus their
+  uploaded files and queued webhook deliveries (every built-in store implements `find_respondent` /
+  `erase_respondent`; a custom store must too). Copies outside the app — exports, backups, logs,
+  webhook/CRM/panel receivers, your warehouse — are yours to clear. Decide your retention policy
+  before you collect anything.
 - **☐ Consent & disclosure.** The survey's consent/notice text must be accurate for your
   jurisdiction and audience. If you enable **LLM analysis** (`source: llm`, `SURVEY_LLM_ENRICH`) or
   **conversation mode**, respondent data is sent to the model provider you configured — disclose it.
@@ -47,9 +48,9 @@ runtime serves it — see [DEPLOY.md](DEPLOY.md).
 ## What the engine *does* give you
 
 The engine evaluates the **logic** (screen-out / quota / branch / validation) as data, not a model's
-judgment; keeps definitions **immutable and versioned** (in-flight respondents stay on their
-version); signs outbound webhooks and panel passbacks and verifies signed URLs; records opt-in LLM
-analysis in a per-response `llm_audit`; erases a subject's responses on request; and emits a
+judgment; keeps definitions **immutable and versioned** (in-flight respondents stay on their version);
+signs outbound webhooks and panel passbacks and verifies signed URLs; records opt-in LLM analysis in a
+per-response `llm_audit`; erases a subject's responses, sessions and uploads on request; and emits a
 **stable export shape** your downstream tooling can rely on. Everything about *where the data lives,
 who can reach it, how it's encrypted, and when it's deleted* is the deployer's call.
 

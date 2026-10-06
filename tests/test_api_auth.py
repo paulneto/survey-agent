@@ -43,6 +43,35 @@ def client(monkeypatch, tmp_path):
     app.dependency_overrides.clear()
 
 
+STRONG_SESSION_KEY = "test-session-key-0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _reload_app():
+    importlib.reload(importlib.import_module("survey_agent.api.auth.config"))
+    return importlib.reload(appmod).app
+
+
+@pytest.fixture
+def oauth_client(monkeypatch, tmp_path):
+    """Gateway with Google sign-in configured and a strong session key — the ONLY mode in which
+    session cookies are honoured (and the /keys UI is mounted)."""
+    pytest.importorskip("itsdangerous")
+    pytest.importorskip("authlib")
+    monkeypatch.setenv("SURVEY_DEFINITION_SOURCE", "file")
+    monkeypatch.setenv("SURVEY_DIR", str(tmp_path))
+    monkeypatch.delenv("SURVEY_API_TOKEN", raising=False)
+    monkeypatch.setenv("SURVEY_GOOGLE_CLIENT_ID", "client-id")
+    monkeypatch.setenv("SURVEY_GOOGLE_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("SURVEY_SESSION_JWT_KEY", STRONG_SESSION_KEY)
+    oapp = _reload_app()
+    store = apikeys.InMemoryKeyStore()
+    oapp.dependency_overrides[get_key_store] = lambda: store
+    c = TestClient(oapp)
+    c.keystore = store
+    yield c
+    oapp.dependency_overrides.clear()
+
+
 # ---- health / whoami ----
 
 def test_health_is_public(client):
@@ -103,21 +132,30 @@ def test_single_bearer_token_gate(client, monkeypatch):
     assert client.get("/whoami", headers={"Authorization": "Bearer sek"}).json()["principal"]["kind"] == "token"
 
 
-# ---- OAuth session-cookie half ----
+# ---- OAuth session-cookie half (only with Google sign-in + a strong session key) ----
 
-def test_session_cookie_authenticates_as_user(client):
-    client.cookies.set(sessions.COOKIE, sessions.issue("jane@example.com"))
-    r = client.get("/whoami")
+def test_session_cookie_authenticates_as_user(oauth_client):
+    oauth_client.cookies.set(sessions.COOKIE, sessions.issue("jane@example.com"))
+    r = oauth_client.get("/whoami")
     assert r.status_code == 200
     p = r.json()["principal"]
     assert p["kind"] == "user" and p["email"] == "jane@example.com"
-    client.cookies.clear()
+    oauth_client.cookies.clear()
 
 
-def test_session_cookie_authenticates_v1(client):
-    client.keystore.add("agent")  # turn auth on so /v1 is gated
+def test_session_cookie_authenticates_v1(oauth_client):
+    assert oauth_client.get("/v1/surveys").status_code == 401        # OAuth on → /v1 gated
+    oauth_client.cookies.set(sessions.COOKIE, sessions.issue("jane@example.com"))
+    assert oauth_client.get("/v1/surveys").status_code == 200
+    oauth_client.cookies.clear()
+
+
+def test_session_cookie_ignored_without_oauth(client):
+    # Bearer/API-key mode: a cookie (even one signed with the server's own key) is never a principal.
+    client.keystore.add("agent")
     client.cookies.set(sessions.COOKIE, sessions.issue("jane@example.com"))
-    assert client.get("/v1/surveys").status_code == 200
+    assert client.get("/v1/surveys").status_code == 401
+    assert client.get("/whoami").json()["principal"]["kind"] == "anonymous"
     client.cookies.clear()
 
 
@@ -128,21 +166,28 @@ def test_login_503_when_oauth_unconfigured(client):
 
 # ---- /keys UI: sign-in-only, no privilege escalation from a key ----
 
-def test_keys_page_redirects_anonymous(client):
-    r = client.get("/keys", follow_redirects=False)
+def test_keys_ui_not_mounted_without_oauth(client):
+    # No Google sign-in → nobody can be a signed-in human → the key UI isn't served at all.
+    assert client.get("/keys", follow_redirects=False).status_code == 404
+    assert client.post("/keys", data={"label": "x"}).status_code in (404, 405)
+
+
+def test_keys_page_redirects_anonymous(oauth_client):
+    r = oauth_client.get("/keys", follow_redirects=False)
     assert r.status_code == 302 and r.headers["location"] == "/auth/google/login"
 
 
-def test_keys_create_is_user_only_not_api_key(client):
+def test_keys_create_is_user_only_not_api_key(oauth_client):
     # an API key must NOT be able to mint keys (no privilege escalation)
-    key = client.keystore.add("agent")
-    r = client.post("/keys", data={"label": "x"}, headers={"Authorization": f"Bearer {key}"})
+    key = oauth_client.keystore.add("agent")
+    r = oauth_client.post("/keys", data={"label": "x"}, headers={"Authorization": f"Bearer {key}"})
     assert r.status_code == 401
 
 
-def test_keys_create_and_revoke_as_user(client):
+def test_keys_create_and_revoke_as_user(oauth_client):
     import re
 
+    client = oauth_client
     client.cookies.set(sessions.COOKIE, sessions.issue("jane@example.com"))
     assert client.get("/keys").status_code == 200                      # page renders for a signed-in user
     r = client.post("/keys", data={"label": "jane-cli"})               # create → key shown once
@@ -173,10 +218,10 @@ def _extra_denylist():
     return [w.strip().lower() for w in words]
 
 
-def test_keys_ui_is_vendor_neutral(client):
-    client.cookies.set(sessions.COOKIE, sessions.issue("jane@example.com"))
-    body = client.get("/keys").text.lower()
-    client.cookies.clear()
+def test_keys_ui_is_vendor_neutral(oauth_client):
+    oauth_client.cookies.set(sessions.COOKIE, sessions.issue("jane@example.com"))
+    body = oauth_client.get("/keys").text.lower()
+    oauth_client.cookies.clear()
     hosts = set(re.findall(r"https?://([a-z0-9.-]+)", body)) | set(re.findall(r"@([a-z0-9-]+(?:\.[a-z0-9-]+)+)", body))
     for h in hosts:
         assert h in _ALLOWED_HOSTS or any(h.endswith("." + a) for a in _ALLOWED_HOSTS), h
@@ -297,12 +342,20 @@ def test_fail_loud_when_oauth_configured_without_session_key(monkeypatch):
         importlib.reload(appmod)
 
 
+def test_fail_loud_when_oauth_configured_with_short_session_key(monkeypatch):
+    monkeypatch.setenv("SURVEY_GOOGLE_CLIENT_ID", "client-id")
+    monkeypatch.setenv("SURVEY_GOOGLE_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("SURVEY_SESSION_JWT_KEY", "too-short-secret")
+    with pytest.raises(SystemExit):
+        _reload_app()
+
+
 def test_oauth_with_session_key_imports_ok(monkeypatch):
     # The mirror of the fail-loud test: a real session key lets the OAuth-configured app import.
     pytest.importorskip("itsdangerous")  # SessionMiddleware dep — only present with the [auth] extra
     monkeypatch.setenv("SURVEY_GOOGLE_CLIENT_ID", "client-id")
     monkeypatch.setenv("SURVEY_GOOGLE_CLIENT_SECRET", "client-secret")
-    monkeypatch.setenv("SURVEY_SESSION_JWT_KEY", "a-real-strong-secret")
+    monkeypatch.setenv("SURVEY_SESSION_JWT_KEY", STRONG_SESSION_KEY)
     importlib.reload(importlib.import_module("survey_agent.api.auth.config"))
     reloaded = importlib.reload(appmod)
     assert reloaded.app is not None

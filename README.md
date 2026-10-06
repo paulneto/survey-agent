@@ -45,9 +45,9 @@ checking every step.
   for the design decision in full, or
   [the architecture](https://github.com/paulneto/survey-agent/blob/main/docs/ENGINEERING.md#1-architecture).
 - **You own everything, and it runs anywhere.** Flat files or a database, a container or a serverless
-  function, a drop-in `survey_url` for any panel, CRM or email. The engine is about 2,600 lines of pure
-  Python with two dependencies (`jsonschema`, `PyYAML`). No per-response license, no seats. Bring your
-  own Claude or OpenAI key.
+  function, a drop-in `survey_url` for any panel, CRM or email. The engine is about 2,700 lines of pure
+  Python with three dependencies (`jsonschema`, `PyYAML`, `regex`). No per-response license, no seats.
+  Bring your own Claude or OpenAI key.
 
 ### Who it's for
 
@@ -123,16 +123,19 @@ There's also a distinct third entry point:
   `settings.url_signing.required` is set). Launch is human-gated by an approval token (see
   [Use it inside your LLM](#use-it-inside-your-llm-file-access-surfaces)). A per-survey
   `settings.retake` (`once` by default, or `multiple`) controls whether one invite link can be taken
-  again. `survey-agent dsar <uid>` finds a respondent's responses in the configured store and
-  `--delete` erases them; copies you've exported or backed up elsewhere remain yours to handle.
+  again. `survey-agent dsar <id>` finds everything the app holds for a respondent (responses and
+  sessions, on every identity variable in use) and `--delete` erases it, including their uploaded
+  files and queued webhook deliveries; copies already sent or exported elsewhere remain yours to
+  handle.
 
 ### Survey mechanics the engine guarantees
 
 - **Question types.** Radio, checkbox (with an exclusive "none of the above"), dropdown and
   multi-select dropdown, short text (regex / email / phone / length / minimum words), long text,
   number (min / max / percent), rating / Likert, NPS, ranking, grid / matrix (radio or checkbox
-  cells), date, and file upload (extension / size / count validated, stored in a pluggable local or S3
-  blob store). Display-only image, video and instructions blocks render formatted Markdown. They all
+  cells), date, and file upload (extension / size / count validated before storing, kept in a
+  pluggable local or S3 blob store). Display-only image, video and instructions blocks render
+  formatted Markdown. They all
   render, validate, simulate, and export. See the
   [capability matrix](https://github.com/paulneto/survey-agent/blob/main/docs/FEATURE_COVERAGE.md).
 - **Logic, as data.** Show/hide, page display, skip/branch, disqualify/screen-out, per-option and
@@ -304,8 +307,8 @@ prompt.
 
 **The launch gate.** Marking a survey live is gated by an approval token that a human holds. When
 `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, no surface (the CLI's `launch` / `status` / `publish`, the
-console, or the MCP connector) can mark a survey live without it. When it is unset, the local CLI and
-console can, and the MCP connector still cannot.
+console, the MCP connector, or the API gateway) can mark a survey live without it. When it is unset,
+the local CLI and console can, and the MCP connector and API gateway still cannot.
 
 **As an agent tool: the structured-elicitation primitive.** Any agent can call `begin_survey` and then
 `answer_survey` to run a logic-gated survey inline, mid-task, and get back clean, validated
@@ -350,7 +353,9 @@ the engine as vocabulary, and every survey can use them. The reasoning is in
 - **Conversational mode.** An AI administers the same survey as a chat. The engine stays the source
   of truth for flow, branching, screen-out, and quotas; the AI only phrases questions and maps
   free-text replies to valid answers. It suits choice, number, and text questions; grids, rankings and
-  file uploads aren't supported in chat.
+  file uploads aren't supported in chat. The browser chat at `/chat` is a preview that records
+  nothing; to collect answers conversationally, an agent uses the MCP `begin_survey` /
+  `answer_survey` tools, which hand it the structured result.
 - **Contextual enrichment.** Look up a fact about the respondent at session start (from the fixture
   provider, the reference warehouse adapter, or a provider you write) and use it in logic, piping, or
   routing.
@@ -383,9 +388,10 @@ the engine as vocabulary, and every survey can use them. The reasoning is in
   [docs/HOSTING.md](https://github.com/paulneto/survey-agent/blob/main/docs/HOSTING.md) for options
   and where to host the remote MCP connector. Themes (`dark`, `ocean`, `paper`, or your own) control
   look and feel.
-- **Public runtime.** `survey-agent serve --public` binds `0.0.0.0` and serves only `live` surveys,
-  as a form or (at `/chat`) a conversation, using whatever store and integration you configured
-  (defaults: `file`, `none`). `serve --preview` serves drafts too, and only on localhost.
+- **Public runtime.** `survey-agent serve --public` binds `0.0.0.0` and serves only `live` surveys
+  as a form, using whatever store and integration you configured (defaults: `file`, `none`).
+  `serve --preview` serves drafts too, and only on localhost; it (and `demo`) also serves the `/chat`
+  preview, which records nothing.
 
 ## Project layout
 

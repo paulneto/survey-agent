@@ -11,7 +11,7 @@ import re
 from survey_agent.engine import terminal
 from survey_agent.engine.runtime import response_id, STATUS_COMPLETED
 
-from test_server_http import running_server, _get, _post
+from test_server_http import running_server, _get, _post, _tok
 
 
 # ----------------------------------------------------------------- unit: response identity
@@ -44,7 +44,8 @@ def _complete(base, uid=10, rid=20):
     _, html = _get(f"{base}/s/t_http?uid={uid}&rid={rid}&group=demo")
     sid = re.search(r'name=session_id value="([^"]+)"', html).group(1)
     pid = re.search(r'name=page_id value="([^"]+)"', html).group(1)
-    _, done = _post(f"{base}/s/t_http/submit", {"session_id": sid, "page_id": pid, "q_consent": "yes"})
+    _, done = _post(f"{base}/s/t_http/submit", {"session_id": sid, "session_token": _tok(html),
+                                                 "page_id": pid, "q_consent": "yes"})
     return done
 
 

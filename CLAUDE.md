@@ -19,6 +19,7 @@ scope** — they belong to whatever panel adapter a deployer plugs into the `int
   are the gate.
 - **Surveys/themes/enrichments/triggers are flat files.** Add a file + a small hook; don't build CMS UI.
 - **Definitions are immutable + versioned.** Edits create a new version; in-flight sessions stay pinned.
+  The `file` source keeps snapshots in `surveys/.versions/<id>/v<N>.survey.json` — commit them.
 - **Server-driven page flow:** a question that depends on another answer goes on a *later page*
   (`validate` rejects a same-page or later-page dependency). The same holds for a `repeat` source.
 - **Repeated answers are ordinary answers.** A `repeat` stores each item's answer as `qid[item]`
@@ -26,9 +27,10 @@ scope** — they belong to whatever panel adapter a deployer plugs into the `int
 - **Display-only types** (`image`, `video`, `instructions`) are stimulus — never required, never validated.
 
 ## Don't break the drop-in contract
-- `survey_url` captures **all** query params into `url_variables`.
+- `survey_url` captures **all** query params into `url_variables` (stored on the response).
 - Terminals produce neutral lifecycle events (`engine/terminal.py`); the selected integration
   (`SURVEY_INTEGRATION`: `none`/`redirect`/`webhook`/plugin) delivers them with an idempotency key.
+  An event's `url_variables` carries only the declared `settings.url_variables` + identity vars.
 - The export shape (`engine/export.py`) is stable and documented so DSAR / data-export tooling keeps
   working with only a base-URL/auth swap. Repeated answers add one `qid[item]` entry each, with an
   extra `repeat: {source, value, label}` — additive, so existing consumers are unaffected.
@@ -53,11 +55,12 @@ commands + the flow).
   `survey-agent convo --scripted …` for the conversational mode.
 
 ## Conventions
-- Pure-engine deps are tiny (`jsonschema` + `pyyaml`); everything else is an extra:
-  `[llm]` (Anthropic), `[openai]` (GPT), `[mcp]` (connector), `[api]` (the gateway: FastAPI/uvicorn),
-  `[auth]` (gateway Google OAuth + `sa_` API keys), `[mongo]` (the reference Mongo store), `[firebolt]`
-  (the reference warehouse-enrichment adapter), `[s3]` (S3 blob store for `file` uploads), `[data]`
-  (parquet export). The `sqlite` store is built in (stdlib — no extra).
+- Pure-engine deps are tiny (`jsonschema` + `pyyaml` + `regex`, the last for timeout-bounded pattern
+  matching); everything else is an extra: `[llm]` (Anthropic), `[openai]` (GPT), `[mcp]` (connector),
+  `[api]` (the gateway: FastAPI/uvicorn), `[auth]` (gateway Google OAuth sign-in + the `/keys` page;
+  install as `[api,auth]`), `[mongo]` (the reference Mongo store), `[firebolt]` (the reference
+  warehouse-enrichment adapter), `[s3]` (S3 blob store for `file` uploads), `[data]` (parquet export).
+  The `sqlite` store is built in (stdlib — no extra).
 - Storage via `SURVEY_STORE` (memory|file|sqlite|mongo|http|`your.pkg:Store`; unset = `file`);
   enrichment via `SURVEY_ENRICH` (static|firebolt|`your.pkg:Provider`); passback via
   `SURVEY_INTEGRATION` (none|redirect|webhook|panel|mailchimp|your plugin; unset = `none`). These are **seams**: mongo, firebolt, and
@@ -67,7 +70,7 @@ commands + the flow).
 - Skills live in `skills/`; the authoring loop is brief → draft → validate → simulate → human approve
   → launch → report. **The human approval gate before launch is mandatory** (launching fields to real
   people and spends budget). When `SURVEY_LAUNCH_APPROVAL_TOKEN` is set, no surface can mark a survey
-  live without it; when unset, the local CLI/console can and the MCP connector cannot.
+  live without it; when unset, the local CLI/console can and the MCP connector / API gateway cannot.
 - Keep this repo free of any deployer-specific (panel/vendor) names and panel vocabulary — those
   belong in a private overlay/plugin, not the open core.
 - Docs: `docs/README.md` is the map and `src/survey_agent/docs.py` mirrors it for `survey-agent docs`;

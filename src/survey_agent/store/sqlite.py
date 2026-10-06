@@ -20,6 +20,9 @@ import json
 import os
 import sqlite3
 
+from . import (check_reservation, erasure_result, norm_id_fields, response_matches,
+               session_matches)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -124,6 +127,31 @@ class SQLiteStore:
             c.execute("COMMIT")
             return row["count"]
 
+    def reserve_quotas(self, survey_id, version, limits):
+        """All-or-nothing: increment every bucket in `limits` iff each limited one is below its limit.
+        One BEGIN IMMEDIATE transaction (takes the write lock up front), so the check and the increments
+        are atomic across threads and processes."""
+        if not limits:
+            return True
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                rows = c.execute("SELECT quota_id, count FROM quotas WHERE survey_id=? AND version=?",
+                                 (survey_id, version)).fetchall()
+                if not check_reservation({r["quota_id"]: r["count"] for r in rows}, limits):
+                    c.execute("ROLLBACK")
+                    return False
+                for qid in limits:
+                    c.execute("INSERT INTO quotas (survey_id, version, quota_id, count) VALUES (?, ?, ?, 1) "
+                              "ON CONFLICT(survey_id, version, quota_id) DO UPDATE SET count=count+1",
+                              (survey_id, version, qid))
+                c.execute("COMMIT")
+                return True
+            except BaseException:
+                if c.in_transaction:
+                    c.execute("ROLLBACK")
+                raise
+
     # ---- responses (append-only) ----
     def record_response(self, survey_id, response):
         uid = (response.get("url_variables") or {}).get("uid")
@@ -144,29 +172,64 @@ class SQLiteStore:
                     b["disqualified"] += r["n"]
         return out
 
-    def list_responses(self, survey_id=None, uid=None):
+    def list_responses(self, survey_id=None, uid=None, id_fields=None):
+        """`uid` matches url var `uid` (the indexed column) by default; pass `id_fields` to match the id
+        against any of those url-var names (custom respondent identity) — a scan, fine for DSAR."""
+        fields = norm_id_fields(id_fields)
         clauses, params = [], []
         if survey_id is not None:
             clauses.append("survey_id=?")
             params.append(survey_id)
-        if uid is not None:
+        if uid is not None and fields == ("uid",):
             clauses.append("uid=?")
             params.append(str(uid))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self._conn() as c:
             rows = c.execute("SELECT data FROM responses" + where + " ORDER BY seq", params).fetchall()
-            return [json.loads(r["data"]) for r in rows]
+            out = [json.loads(r["data"]) for r in rows]
+        if uid is not None and fields != ("uid",):
+            out = [r for r in out if response_matches(r, uid, fields)]
+        return out
+
+    def _matching(self, c, respondent_id, fields, survey_id):
+        rq, rp = "SELECT seq, data FROM responses", []
+        if survey_id is not None:
+            rq, rp = rq + " WHERE survey_id=?", [survey_id]
+        resp = [(r["seq"], json.loads(r["data"])) for r in c.execute(rq + " ORDER BY seq", rp)]
+        resp = [(k, d) for k, d in resp if response_matches(d, respondent_id, fields)]
+        sess = [(r["session_id"], json.loads(r["data"]))
+                for r in c.execute("SELECT session_id, data FROM sessions")]
+        sess = [(k, d) for k, d in sess if session_matches(d, respondent_id, fields)
+                and (survey_id is None or d.get("survey_id") == survey_id)]
+        return resp, sess
+
+    def find_respondent(self, respondent_id, id_fields=("uid",), survey_id=None):
+        with self._conn() as c:
+            resp, sess = self._matching(c, respondent_id, norm_id_fields(id_fields), survey_id)
+        return {"responses": [d for _, d in resp], "sessions": [d for _, d in sess]}
+
+    def erase_respondent(self, respondent_id, id_fields=("uid",), survey_id=None):
+        """DSAR erasure: delete every matching response AND session (partial sessions, retakes, every
+        survey) in one transaction. Returns counts + the upload refs / webhook keys found in them."""
+        fields = norm_id_fields(id_fields)
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                resp, sess = self._matching(c, respondent_id, fields, survey_id)
+                c.executemany("DELETE FROM responses WHERE seq=?", [(k,) for k, _ in resp])
+                c.executemany("DELETE FROM sessions WHERE session_id=?", [(k,) for k, _ in sess])
+                c.execute("COMMIT")
+            except BaseException:
+                if c.in_transaction:
+                    c.execute("ROLLBACK")
+                raise
+        return erasure_result([d for _, d in resp], [d for _, d in sess])
 
     def delete_responses(self, uid=None, survey_id=None):
-        """Erasure hook (DSAR): delete responses matching uid and/or survey_id. Returns count removed."""
-        clauses, params = [], []
+        """Compat wrapper. With a uid this is a full respondent erasure (responses AND sessions, matched
+        on url var `uid`); with only survey_id it drops that survey's responses. Returns responses removed."""
         if uid is not None:
-            clauses.append("uid=?")
-            params.append(str(uid))
-        if survey_id is not None:
-            clauses.append("survey_id=?")
-            params.append(survey_id)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+            return self.erase_respondent(uid, ("uid",), survey_id)["responses"]
+        where, params = (" WHERE survey_id=?", [survey_id]) if survey_id is not None else ("", [])
         with self._conn() as c:
-            cur = c.execute("DELETE FROM responses" + where, params)
-            return cur.rowcount
+            return c.execute("DELETE FROM responses" + where, params).rowcount

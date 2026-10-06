@@ -2,6 +2,9 @@
 restart and not shared across instances)."""
 import threading
 
+from . import (check_reservation, erasure_result, norm_id_fields, response_matches,
+               session_matches)
+
 
 class MemoryStore:
     def __init__(self):
@@ -38,24 +41,62 @@ class MemoryStore:
             counts[quota_id] = counts.get(quota_id, 0) + 1
             return counts[quota_id]
 
+    def reserve_quotas(self, survey_id, version, limits):
+        """All-or-nothing: increment every bucket in `limits` iff each limited one is below its limit."""
+        with self._lock:
+            counts = self._quotas.setdefault((survey_id, version), {})
+            if not check_reservation(counts, limits):
+                return False
+            for qid in (limits or {}):
+                counts[qid] = counts.get(qid, 0) + 1
+            return True
+
     def record_response(self, survey_id, response):
         with self._lock:
             self._responses.append(response)
 
-    def list_responses(self, survey_id=None, uid=None):
-        out = self._responses
+    def list_responses(self, survey_id=None, uid=None, id_fields=None):
+        fields = norm_id_fields(id_fields)
+        with self._lock:
+            out = list(self._responses)
         if survey_id is not None:
             out = [r for r in out if r.get("survey_id") == survey_id]
         if uid is not None:
-            out = [r for r in out if str(r.get("url_variables", {}).get("uid")) == str(uid)]
-        return list(out)
+            out = [r for r in out if response_matches(r, uid, fields)]
+        return out
+
+    def find_respondent(self, respondent_id, id_fields=("uid",), survey_id=None):
+        fields = norm_id_fields(id_fields)
+        with self._lock:
+            sessions = [dict(s) for s in self._sessions.values()
+                        if session_matches(s, respondent_id, fields)
+                        and (survey_id is None or s.get("survey_id") == survey_id)]
+        return {"responses": self.list_responses(survey_id, uid=respondent_id, id_fields=fields),
+                "sessions": sessions}
+
+    def erase_respondent(self, respondent_id, id_fields=("uid",), survey_id=None):
+        """DSAR erasure: drop every matching response AND session (partial, retakes, all surveys)."""
+        fields = norm_id_fields(id_fields)
+        with self._lock:
+            gone_r = [r for r in self._responses if response_matches(r, respondent_id, fields)
+                      and (survey_id is None or r.get("survey_id") == survey_id)]
+            gone_ids = {id(r) for r in gone_r}
+            self._responses = [r for r in self._responses if id(r) not in gone_ids]
+            gone_s = [s for s in self._sessions.values() if session_matches(s, respondent_id, fields)
+                      and (survey_id is None or s.get("survey_id") == survey_id)]
+            for s in gone_s:
+                self._sessions.pop(s["session_id"], None)
+            ids = {s["session_id"] for s in gone_s}
+            self._by_key = {k: v for k, v in self._by_key.items() if v not in ids}
+        return erasure_result(gone_r, gone_s)
 
     def delete_responses(self, uid=None, survey_id=None):
-        """Erasure hook (DSAR): drop responses matching uid and/or survey_id. Returns count removed."""
-        def matches(r):
-            return ((uid is None or str(r.get("url_variables", {}).get("uid")) == str(uid))
-                    and (survey_id is None or r.get("survey_id") == survey_id))
+        """Compat wrapper. With a uid this is a full respondent erasure (responses AND sessions, matched
+        on url var `uid`); with only survey_id it drops that survey's responses. Returns responses removed."""
+        if uid is not None:
+            return self.erase_respondent(uid, ("uid",), survey_id)["responses"]
         with self._lock:
             before = len(self._responses)
-            self._responses = [r for r in self._responses if not matches(r)]
+            self._responses = [r for r in self._responses
+                               if not (survey_id is None or r.get("survey_id") == survey_id)]
             return before - len(self._responses)

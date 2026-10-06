@@ -35,9 +35,11 @@ The whole "logic language" is the recursive `evaluate(node, ctx)` function in `e
 every survey (show/hide, page logic, skip, disqualify, over-quota, routing). The engine has **no
 `eval()` and no scripting**: operators are a closed set (`equals`, `contains`, `is_one_of`,
 `greater_than`, `between`, `regex_match`, …). `validate` rejects regex patterns longer than 200
-characters or with nested unbounded quantifiers, and input is matched up to 2,000 characters. You cannot express arbitrary code in a survey, by
-design. An LLM can author the JSON; the JSON-Schema validator and semantic lint (`engine/validate.py`)
-gate it before it runs.
+characters, with nested unbounded quantifiers (`(x+)+`), or with an alternation inside a repeated
+group (`(a|aa)+`). At run time every match runs on the `regex` engine with a 50 ms timeout, on at most
+2,000 characters of input. A match that times out is treated as no match in logic, and the check is skipped (answer accepted) in question validation. You cannot express arbitrary code
+in a survey, by design. An LLM can author the JSON; the JSON-Schema validator and semantic lint
+(`engine/validate.py`) gate it before it runs.
 
 **The one place code is generated** is the enrichment layer's reference warehouse adapter, which
 compiles an enrichment *spec* (also data: `event_type + window + criteria + operation`) into a SQL
@@ -51,7 +53,7 @@ per-survey software.
 DEFINITION (data, changes per survey)   surveys/*.survey.json — pages·questions·logic AST·piping·repeats·quotas·actions
         │  authored by people or agents · reviewed in a PR · validated · immutable + versioned
         ▼
-ENGINE (fixed interpreter, ~2,600 lines) engine/ — never changes per survey; covered by the test suite
+ENGINE (fixed interpreter, ~2,700 lines) engine/ — never changes per survey; covered by the test suite
         │  runtime.py (page-flow state machine) · ast_eval.py (logic) · piping.py · repeat.py · randomize.py · validate.py
         ▼
 RUNTIME — the stdlib `survey-agent serve`  (one long-running service; scale by replicas with a shared store)
@@ -63,8 +65,8 @@ page by page, the way a browser loads and renders an HTML file. Agents author th
 engine code. The risky part (the interpreter) is written and tested once, while surveys stay cheap,
 analyzable, diffable documents.
 
-The engine is about 2,600 lines of pure Python with no dependencies beyond the standard library plus
-`jsonschema` and `PyYAML`.
+The engine is about 2,700 lines of pure Python with no dependencies beyond the standard library plus
+`jsonschema`, `PyYAML` and `regex` (survey-authored patterns run on `regex` with a match timeout).
 
 ### 1.2 What runs where
 
@@ -89,13 +91,18 @@ store (file / sqlite / mongo / http / your own) ── sessions · quota counter
   and `none`); `--preview` serves drafts too, on localhost only.
 - **The API gateway** (`survey-agent api`, the `[api]` extra) is the control plane: definitions,
   lifecycle, and read-side response access over HTTP. **It runs open (no auth) unless you configure
-  auth**: a bearer `SURVEY_API_TOKEN`, Google OAuth (the `[auth]` extra, `SURVEY_OAUTH_*`), or `sa_`
-  API keys. Never expose it unauthenticated.
+  auth**: a bearer `SURVEY_API_TOKEN`, `sa_` API keys, or Google OAuth (the `[auth]` extra,
+  `SURVEY_GOOGLE_CLIENT_ID` / `_SECRET`, plus a strong `SURVEY_SESSION_JWT_KEY`). Session cookies are
+  ignored unless Google sign-in is configured. Never expose it unauthenticated.
 - **The engine (`engine/`) is pure Python**, with no database, network, or framework imports. It is
   the correctness core and is reused by the runtime, the CLI (`report`/`insights`/`export`/
   `dashboard --live` read the local `SURVEY_STORE`), the simulator, the MCP tools, and the demo.
 - **Definitions are immutable and versioned.** In-flight sessions pin their version, so an edit never
-  corrupts a respondent's session or rewrites history.
+  corrupts a respondent's session or rewrites history. The `file` source keeps each version as a
+  snapshot under `<SURVEY_DIR>/.versions/<id>/v<N>.survey.json` (commit it for git-based deploys);
+  `mongo` stores every version. If a pinned version can't be loaded, the runtime never continues the
+  session on different content: a submit asks the respondent to reopen their link, and the invite
+  link restarts the take on the live version.
 
 ### 1.3 Modules & extension points
 
@@ -112,7 +119,7 @@ The core is `engine/` (pure, offline). Everything else plugs in via selectors:
 | API gateway (front door) | `api/` (FastAPI, `[api]` extra): exposes the definitions + read-side store seams over HTTP. Clients (console/agent/CLI) set `…=http` and become stdlib HTTP clients (no extra dependency) instead of opening their own DB connection. The respondent runtime keeps a direct store (hot path). | `SURVEY_API_BASE`, `SURVEY_API_TOKEN` |
 | Serving gate (lifecycle) | the runtime serves respondents only when state ∈ serve-states (default `live`); `paused`/`closed` show their pages, other pre-live states show "not open yet"; operators preview pre-live surveys with a token (preview sessions collect nothing). Marking live pins `live_version`. A survey with no registry state (single-file `serve`) is unmanaged and served as before | `SURVEY_SERVE_STATES`, `SURVEY_PREVIEW_TOKEN` |
 | Launch gate | one rule for every surface: with a token set, marking live needs it; unset, the local CLI/console may mark live and the MCP connector may not | `SURVEY_LAUNCH_APPROVAL_TOKEN` |
-| Uploads (blob store) | `store/uploads.py` (`local`/`s3`): bytes of `file` answers; the response keeps only a reference | `SURVEY_UPLOAD_STORE` |
+| Uploads (blob store) | `store/uploads.py` (`local`/`s3`): bytes of `file` answers; the response keeps only a reference. Contract: `put`, `open`, `url`, `delete` (used by erasure and to drop rejected uploads); every upload gets a unique key, so nothing is overwritten | `SURVEY_UPLOAD_STORE` |
 | Context sources | `enrich/`: `static` (fixtures) and the reference warehouse adapter; `source: url_var`; `source: llm` (completion-time analysis) | `SURVEY_ENRICH`, per-spec `source` |
 | Integrations (passback) | `integrations/`: `none`/`redirect`/`webhook`/`panel`/`mailchimp` + your plugin; `panel` and `mailchimp` are reference examples of the seam | `SURVEY_INTEGRATION` |
 | Webhook-action outbox | `integrations/outbox.py`: durable retry + dead-letter for mid-survey `webhook` actions (not terminal passbacks) | `SURVEY_OUTBOX`, `survey-agent outbox` |
@@ -210,24 +217,39 @@ stderr; silence with `SURVEY_AGENT_NO_DOCTOR=1`).
 needs:
 - **memory**: tests and throwaway runs only (lost on restart).
 - **file** (default): flat JSONL responses, JSON sessions, and quota files under `SURVEY_DATA_DIR`
-  (default `./survey_data`). Inspectable, easy to back up or sync, zero infrastructure. File-locked
-  quota increments are safe in a **single process** only.
+  (default `./survey_data`). Inspectable, easy to back up or sync, zero infrastructure. Quota
+  reservations hold an OS file lock (POSIX, local disk), but sessions and responses are not locked
+  across processes, so run **one runtime process** on it.
 - **sqlite**: one SQLite file, with quota increments that are **atomic and safe across threads and
   processes** (WAL mode). Still pure stdlib, no server. The step up from `file` for multiple workers
   on one box. Path via `SURVEY_SQLITE_PATH`. (Not for multiple *hosts*: SQLite over NFS is unsafe.)
 - **mongo**: a **reference** multi-host backend (one option, not a requirement). Idempotent session
-  creation (unique `(survey_id, rid, uid)`), atomic quota increments, indexed uid lookup. Read it as a
+  creation (unique `(survey_id, rid, uid)`), atomic quota reservation, indexed uid lookup. Read it as a
   worked example of the store contract.
 - **http**: the store seam over the API gateway, for clients (console, CLI, agents) that shouldn't
   hold a database connection.
 - **bring your own**: set `SURVEY_STORE=your.pkg:YourStore` and implement the store contract (the
-  methods listed in `store/__init__.py`, e.g. `get_or_create_session`, `incr_quota`,
-  `record_response`, `delete_responses`) on Postgres, DynamoDB, Redis, or your warehouse. For
-  multiple hosts, use this or `mongo`.
+  methods listed in `store/__init__.py`, e.g. `get_or_create_session`, `reserve_quotas`,
+  `record_response`, `find_respondent`, `erase_respondent`) on Postgres, DynamoDB, Redis, or your
+  warehouse. For multiple hosts, use this or `mongo`.
 
-Every store implements `delete_responses`, so `survey-agent dsar <uid> [--survey ID] --delete` finds
-and erases a subject's responses uniformly. Backups, exports, and any copies in your downstream
-systems remain your responsibility.
+Two parts of the contract carry correctness guarantees:
+
+- **`reserve_quotas(survey_id, version, limits)`** increments every listed quota counter only if each
+  limited one is below its limit, atomically and all-or-nothing, and returns whether it reserved. A
+  completion reserves every bucket the session falls into; if any is full, the completion becomes the
+  survey's over-quota ending. The built-in stores provide it (`file` with an OS file lock, `sqlite` in
+  one transaction, `mongo` in a transaction or with compensating conditional increments). A store
+  without it gets a process-local fallback that is only correct for a single runtime process.
+- **`find_respondent(id, id_fields, survey_id)` / `erase_respondent(...)`** match a respondent by value
+  on any of the identity url variables in `id_fields`: responses on `url_variables`, sessions on
+  `url_vars`, across every survey, partial sessions and retakes included. `erase_respondent` deletes
+  them and returns the upload refs and webhook idempotency keys it found, so the caller can delete the
+  upload blobs and queued outbox deliveries. `delete_responses` remains as a compatibility wrapper.
+
+`survey-agent dsar <id> [--survey ID] --delete` uses these to erase a subject's responses, sessions,
+uploaded files and queued webhook deliveries uniformly. Backups, exports, passbacks already delivered,
+and any copies in your downstream systems remain your responsibility.
 
 > With the default `file` definition source, definitions are files in git; with a runtime definition
 > store (`SURVEY_DEFINITION_SOURCE=mongo` or `http`) they're published to the store (version-pinned,
@@ -302,7 +324,8 @@ Alarm on, at minimum:
   webhook actions (set `SURVEY_OUTBOX_RETRY_SECONDS` for a background sweep). Retries are safe
   because each intent has a stable id.
 - Runtime 5xx rates; database CPU and connections; LLM provider throttling where authoring/analysis runs.
-- Correlate logs by response id (`rid` by default).
+- Correlate logs by the hashed session / response id (`h:…`): log fields named `session_id` and
+  `response_id` are hashed, and `url` is reduced to scheme, host and path (`obs.py`).
 
 **Common ops:**
 - *Survey logic wrong after launch:* edit, cut a new version, re-publish; in-flight respondents are
@@ -310,7 +333,8 @@ Alarm on, at minimum:
 - *Passbacks not landing:* check `SURVEY_INTEGRATION`, the integration's URLs, and its shared secret
   (`survey-agent doctor` shows the resolved config).
 - *Over-quota firing early:* check the store's quota counters against the survey's limits; confirm
-  the quota increments on complete.
+  the quota is reserved on complete. A completion that finds any of its buckets full becomes the
+  over-quota ending, so a full cell can turn away a respondent who also counts toward other cells.
 - *Enrichment slow or empty:* check data-source latency and the cache; confirm the spec's
   window/criteria; gate behavior pages so they no-op when the fact is absent.
 
@@ -326,8 +350,10 @@ Alarm on, at minimum:
 - Lifecycle events are neutral: `started`, `completed`, `terminated` (disqualified or over-quota),
   `terminated_by_user`. Each event carries
   `{event, status, reason_code, survey_id, response_id, url_variables, idempotency_key}`; the selected
-  integration maps it to your system's wire format. (The stdlib runtime has no abandon detection, so it
-  never emits `terminated_by_user` itself; a plugin or host can.)
+  integration maps it to your system's wire format. The event's `url_variables` holds only the
+  survey's declared `settings.url_variables` plus the identity variables; every captured param is
+  still stored on the response. (The stdlib runtime has no abandon detection, so it never emits
+  `terminated_by_user` itself; a plugin or host can.)
 - `webhook` **actions** fire once per session when their condition is true; the engine returns them as
   intents and the runtime delivers them (durably with `SURVEY_OUTBOX=1`).
 - Export response shape: `{id, date_started, date_submitted, status, url_variables,

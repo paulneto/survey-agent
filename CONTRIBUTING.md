@@ -1,7 +1,7 @@
 # Contributing to survey-agent
 
 Thanks for considering a contribution! survey-agent is a small, deliberately boring **engine** with a
-lot of agentic surface around it. The engine is about 2,600 lines of pure Python and the bar for
+lot of agentic surface around it. The engine is about 2,700 lines of pure Python and the bar for
 changing it is high; most contributions are new *plugins* (a store, an integration, a theme, a context source) or new
 *question types*, which the architecture makes cheap and safe to add.
 
@@ -29,9 +29,9 @@ Everything runs **offline** without an API key (a deterministic stub backs the A
 
 ## Architecture rules (please don't break these)
 
-- **`survey_agent.engine` is pure Python.** Standard library plus `jsonschema` and `PyYAML`; no
-  database, network, web-framework or LLM imports. It's the correctness core, reused by the runtime,
-  simulator, conversation, MCP, and demo. I/O lives in `store/`, `definitions/`, `enrich/`,
+- **`survey_agent.engine` is pure Python.** Standard library plus `jsonschema`, `PyYAML` and
+  `regex`; no database, network, web-framework or LLM imports. It's the correctness core, reused by
+  the runtime, simulator, conversation, MCP, and demo. I/O lives in `store/`, `definitions/`, `enrich/`,
   `integrations/`, and the API gateway (`api/`).
 - **Logic is data, never code.** Conditions are the bounded AST in `engine/ast_eval.py`: no `eval`,
   no scripting. New operators go in the closed set + the schema + the validator + a test.
@@ -51,7 +51,9 @@ Everything runs **offline** without an API key (a deterministic stub backs the A
   (`simulate.py answer_question`), export (`exporting.py` / `engine/export.py`), the schema, **and a
   test**. Run `validate` + `simulate` on a survey that uses it.
 - **A store** → implement the store contract (the methods listed in `store/__init__.py`, including
-  `delete_responses` for erasure) and point `SURVEY_STORE` at `your_pkg.module:YourStore`. Built in:
+  `reserve_quotas` for atomic all-or-nothing quota reservation, and `find_respondent` /
+  `erase_respondent` for DSAR access and erasure across responses and sessions) and point
+  `SURVEY_STORE` at `your_pkg.module:YourStore`. Built in:
   `memory`, `file` (the default), `sqlite`, `http`, plus a reference `mongo`; more database adapters
   belong in their own packages.
 - **An integration** (passback / CRM) → implement `Integration` (`integrations/base.py`); register via
