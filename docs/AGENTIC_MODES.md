@@ -9,8 +9,11 @@ Two rules apply to anything that sends *respondent* data to an LLM (see
 [DATA_SECURITY.md](DATA_SECURITY.md)): it is opt-in or disclosed to the respondent, and the
 runtime's LLM calls on answers are recorded on the response (`llm_audit`).
 
-The LLM is whichever you configure: `ANTHROPIC_API_KEY` (the `[llm]` extra) or `OPENAI_API_KEY`
-(the `[openai]` extra). With no key, each surface falls back to a deterministic offline stub, so
+The LLM is whichever you configure; the `[llm]` extra installs support for all of them.
+`ANTHROPIC_API_KEY` selects Claude and `OPENAI_API_KEY` selects GPT. For any other OpenAI-compatible
+service (Azure OpenAI, OpenRouter, Groq, a local Ollama, ...), set `OPENAI_API_KEY` to its key,
+`OPENAI_BASE_URL` to its address and `SURVEY_LLM_MODEL` to its model id. `SURVEY_LLM` forces a
+provider when more than one key is set (Claude wins under `auto`). With no key, each surface falls back to a deterministic offline stub, so
 everything below runs in tests and demos without a network.
 
 ---

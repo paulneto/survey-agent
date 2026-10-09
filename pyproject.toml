@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "survey-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "An open-source, agentic survey engine — define surveys as data; AI authors, administers, and analyzes them. Runs anywhere."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,8 +31,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-llm = ["anthropic>=0.40"]                 # Claude (authoring / conversational / analysis)
-openai = ["openai>=1.40"]                 # GPT / Codex (same features, your choice of model)
+llm = ["anthropic>=0.40", "openai>=1.40"] # any model: Claude, GPT, or an OpenAI-compatible endpoint (authoring / conversational / analysis)
+openai = ["openai>=1.40"]                 # GPT / OpenAI-compatible only (kept for existing installs; [llm] already includes it)
 mcp = ["mcp>=1.2,<2"]   # 2.x renamed FastMCP → MCPServer; port before lifting
 mongo = ["pymongo"]                       # multi-instance store for the stdlib runtime: SURVEY_STORE=mongo + serve --multi
 api = ["fastapi>=0.110", "uvicorn>=0.23"] # the API gateway (`survey-agent api`), bearer-token / sa_ API-key mode; clients (SURVEY_*=http) need NO extra — stdlib urllib

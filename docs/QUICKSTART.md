@@ -20,7 +20,7 @@ pip install survey-agent
 > or clone the repo and `pip install .`.
 
 The base install pulls only `jsonschema` + `pyyaml` + `regex`. Optional extras: `[llm]`
-(Anthropic-powered authoring/analysis) or `[openai]` (GPT), `[api]` (the FastAPI control-plane gateway
+(AI authoring/analysis with Claude, GPT or any OpenAI-compatible model; bring whichever key you have), `[api]` (the FastAPI control-plane gateway
 — `survey-agent api`), `[mcp]` (the connector), `[mongo]` (the *reference* multi-host store — just
 `pymongo`), and `[dev]` (tests). The `memory`, `file`, and `sqlite` stores need **no extra** (pure
 stdlib).

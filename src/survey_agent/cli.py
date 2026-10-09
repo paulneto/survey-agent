@@ -915,6 +915,9 @@ INIT_DOTENV = """\
 ANTHROPIC_API_KEY=
 # GPT / Codex (get one at platform.openai.com):
 OPENAI_API_KEY=
+# Any OpenAI-compatible service (Azure OpenAI, OpenRouter, Groq, a local Ollama, ...): put its key in
+# OPENAI_API_KEY, its address here, and its model id in SURVEY_LLM_MODEL below.
+# OPENAI_BASE_URL=
 # Provider: auto (default) | anthropic | openai | stub
 # SURVEY_LLM=auto
 # Override the model id (else a sensible default per provider):
@@ -2129,7 +2132,7 @@ def _cmd_doctor(a):
         print("  (not run from a survey-agent source checkout — nothing to reconcile)")
     print("\n  extras:")
     for label, mod in (("mongo store (pymongo)", "pymongo"), ("Claude ([llm])", "anthropic"),
-                       ("GPT ([openai])", "openai"), ("MCP ([mcp])", "mcp")):
+                       ("GPT / OpenAI-compatible ([llm])", "openai"), ("MCP ([mcp])", "mcp")):
         print(f"    {label:22}: {'yes' if extras[mod] else 'no'}")
     src = config["sources"]
     print("\n  config:" + (f"  (config file: {config['config_file']})" if config["config_file"] else

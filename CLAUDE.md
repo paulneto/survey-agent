@@ -65,7 +65,7 @@ commands + the flow).
 
 ## Conventions
 - Pure-engine deps are tiny (`jsonschema` + `pyyaml` + `regex`, the last for timeout-bounded pattern
-  matching); everything else is an extra: `[llm]` (Anthropic), `[openai]` (GPT), `[mcp]` (connector),
+  matching); everything else is an extra: `[llm]` (Claude + OpenAI SDKs: any provider), `[openai]` (OpenAI SDK only), `[mcp]` (connector),
   `[api]` (the gateway: FastAPI/uvicorn), `[auth]` (gateway Google OAuth sign-in + the `/keys` page;
   install as `[api,auth]`), `[mongo]` (the reference Mongo store), `[firebolt]` (the reference
   warehouse-enrichment adapter), `[s3]` (S3 blob store for `file` uploads), `[data]` (parquet export).

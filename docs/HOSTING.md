@@ -30,7 +30,7 @@ seams, not requirements.**
 | | yes | `redirect` / `webhook` (built-in), `panel` (a generic signed passback), `mailchimp` (reference example), or your own plugin |
 | **Enrich answers from behavioral data?** | no (most cases) | skip it (`SURVEY_ENRICH` unset) |
 | | yes | your warehouse via an adapter (the shipped `firebolt` adapter is a reference example) |
-| **Natural-language authoring / conversation / analysis?** | yes | install `[llm]` (Anthropic) or `[openai]` and set the key; without one, a deterministic offline stub runs |
+| **Natural-language authoring / conversation / analysis?** | yes | install `[llm]` and set a Claude, OpenAI or OpenAI-compatible key; without one, a deterministic offline stub runs |
 | **A team sharing one backend?** | yes | run the API gateway (`[api]`) as the sole database owner, **with auth configured**; clients talk HTTP with no database credentials |
 
 If you're a single operator on one box, **`file` (or `sqlite`) on a host with a persistent disk** is

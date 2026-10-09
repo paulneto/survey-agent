@@ -46,7 +46,7 @@ and has the file access the chat surface lacks. That's the whole trick behind th
 These have files, a shell, and (usually) network. Nothing is withheld from them.
 
 ```bash
-pip install "survey-agent[llm]"      # or [openai] to author with a GPT key
+pip install "survey-agent[llm]"      # Claude, GPT or any OpenAI-compatible model
 survey-agent selftest                # zero config, no key, no network
 survey-agent init                    # scaffold surveys/ + config + .env
 ```
@@ -129,12 +129,12 @@ the chat a few structured questions, use `begin_survey` / `answer_survey` instea
 
 ## 5. The distinction people get wrong: *driving host* vs *authoring model*
 
-These are **orthogonal**, and the repo's `[llm]` / `[openai]` extras are about the second one:
+These are **orthogonal**, and the repo's `[llm]` extra is about the second one:
 
 | | What it is | How you choose it |
 |---|---|---|
 | **Driving host** | the agent running the loop — Claude Code, cowork, Codex CLI… | whichever surface you work in (§1) |
-| **Authoring model** | the LLM that turns a brief into survey JSON, powers conversational mode, and writes the insights read-out | `pip install "survey-agent[llm]"` + `ANTHROPIC_API_KEY`, or `[openai]` + `OPENAI_API_KEY` |
+| **Authoring model** | the LLM that turns a brief into survey JSON, powers conversational mode, and writes the insights read-out | `pip install "survey-agent[llm]"` + `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` (plus `OPENAI_BASE_URL` for another OpenAI-compatible service) |
 
 So all four combinations are legal — drive from Claude Code and author with a GPT key, or drive from
 Codex and author with Claude. And **neither is required for correctness**: `validate`, `simulate` and

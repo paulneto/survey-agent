@@ -4,6 +4,16 @@ All notable changes to **survey-agent** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor version may include breaking changes).
 
+## [0.1.1] — 2026-10-09
+
+### Changed
+- The `[llm]` extra now installs both the Anthropic and OpenAI SDKs, so `pip install "survey-agent[llm]"`
+  works with whichever key you have: Claude, GPT, or any OpenAI-compatible service via `OPENAI_BASE_URL`.
+  `[openai]` still works as before.
+- `OPENAI_BASE_URL` is now documented in the scaffolded `.env`, `.env.example` and the agentic-modes guide.
+- The README and docs install from PyPI instead of GitHub.
+- The Docker image no longer prints the development-checkout warning on start.
+
 ## [0.1.0] — 2026-10-09
 
 First public release.

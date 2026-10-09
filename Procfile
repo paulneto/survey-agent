@@ -3,5 +3,5 @@
 # binds 0.0.0.0, serves live surveys only, and sends no passbacks unless SURVEY_INTEGRATION is set.
 # Storage is SURVEY_STORE (default: file under ./survey_data — ephemeral on most PaaS disks; set a
 # database or mount a persistent disk before fielding real respondents).
-# Build step: pip install ".[llm]"   (add OPENAI for GPT/Codex; omit extras for the offline stub)
+# Build step: pip install ".[llm]"   (Claude, GPT or OpenAI-compatible; omit extras for the offline stub)
 web: survey-agent serve --public
