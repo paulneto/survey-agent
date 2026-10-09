@@ -226,20 +226,24 @@ conversational mode):
 
 One sentence in. Every draft has to clear the gates. Schema is first. Coverage is next: the engine
 drives synthetic respondents and checks that a qualified one reaches complete and that every declared
-screen-out is reachable. When the brief states them, incidence and length are checked too. Any gap is
-fed back to the model until it's fixed.
+screen-out is reachable. When the brief states them, incidence and length are checked too (a small
+persona pre-test flags incidence more than 30 points off target). Any gap is fed back to the model
+until it's fixed. A real run (output varies from run to run):
 
 ```text
 $ survey-agent author "screen US adults who currently pay for streaming, incidence 50%, under 3 min"
-authoring with: claude
+authoring with: anthropic
 target incidence: ~50% — each valid draft is persona pre-tested against it
 target length: ~3 min — each valid draft's estimated LOI is checked
   draft 1: valid, but 1 gap(s) — repairing…
-      • [incidence] a realistic persona pre-test qualified ~28% but the brief targets ~50%
-        (too few qualify — loosen or remove a screen-out)
-  draft 2: valid ✅  ·  ✅ coverage gate passed  (104/200 complete, 2/2 screen-outs firing)
-           ·  persona incidence ~47% (target ~50%)  ·  ~2.4 min LOI
-wrote surveys/streaming-screener.survey.json
+      • [coverage] screen-out 'under_18' is defined but never triggered across 200 respondents: its
+        `when` condition is unreachable or wrong (a dead branch) — check the option value it compares
+        against, the page order, and whether an earlier action always catches first
+  draft 2: valid ✅  ·  ✅ coverage gate passed  (17/200 complete, 3/3 screen-outs firing)
+           ·  persona incidence ~25% (target ~50%)  ·  ~0.6 min LOI
+
+wrote surveys/us-streaming-screener.survey.json
+wrote surveys/us-streaming-screener.md  (readable questionnaire + logic notes)
 ```
 
 That repair step, the agent reading why its survey failed on synthetic respondents and fixing it, is
@@ -247,11 +251,12 @@ what a one-shot "ask an LLM for a survey JSON" can't do. Then you preview who ac
 role-played persona respondents, before fielding to a single real person:
 
 ```text
-$ survey-agent pretest surveys/streaming-screener.survey.json --n 5
+$ survey-agent pretest surveys/us-streaming-screener.survey.json --n 5
   1. a heavy subscriber who pays for several streaming services   ✅ COMPLETED
-  2. a retiree new to apps who cancels subscriptions often        ⛔ DISQUALIFIED · non_user
-  3. a budget-conscious student who streams on a shared account   ✅ COMPLETED
-Incidence (qualified): 3/5  (60%)
+  2. a retiree who only watches free, ad-supported channels       ⛔ DISQUALIFIED · not_paying_subscriber
+  3. a student who streams on a parent's account                  ⛔ DISQUALIFIED · not_paying_subscriber
+  …
+Incidence (qualified): 3/5  (60%)    (illustrative: personas differ on every run)
 ```
 
 Run the whole loop yourself with
