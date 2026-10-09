@@ -1,7 +1,9 @@
 # survey-agent respondent runtime image — the pure-Python stdlib runtime (no Django).
 FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# SURVEY_AGENT_NO_DOCTOR: the image installs the package non-editably into site-packages, so the
+# startup "running code from a different checkout" check would always fire — it's a dev-machine guard.
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 SURVEY_AGENT_NO_DOCTOR=1
 WORKDIR /app
 
 # The build context is an allowlist (.dockerignore): only the package source, packaging metadata and

@@ -52,6 +52,7 @@ dashboard.html
 # .mcp.json.example (which IS tracked) and keep your real one out of git
 .mcp.json
 build/
+dist/
 *.egg-info/
 
 # Local-only deployer overlays / private plugins — keep vendor code out of the open core.
