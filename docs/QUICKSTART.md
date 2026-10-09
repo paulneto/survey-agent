@@ -16,9 +16,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install survey-agent
 ```
 
-> The PyPI package ships with the first release; until then install from GitHub:
-> `pip install "git+https://github.com/paulneto/survey-agent"`
-> (with extras: `pip install "survey-agent[llm] @ git+https://github.com/paulneto/survey-agent"`),
+> For unreleased changes on `main`, install from GitHub (`pip install "git+https://github.com/paulneto/survey-agent"`)
 > or clone the repo and `pip install .`.
 
 The base install pulls only `jsonschema` + `pyyaml` + `regex`. Optional extras: `[llm]`

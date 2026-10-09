@@ -14,10 +14,8 @@ You own the data, it runs anywhere, and you bring your own LLM.
 > [docs/HOSTING.md](https://github.com/paulneto/survey-agent/blob/main/docs/HOSTING.md) helps you
 > decide what your deployment actually needs.
 
-> **Install note:** the PyPI package ships with the first release. Until then, install from GitHub:
-> `pip install "git+https://github.com/paulneto/survey-agent"` (with extras:
-> `pip install "survey-agent[llm] @ git+https://github.com/paulneto/survey-agent"`), and for `uvx`
-> use `--from "survey-agent[mcp,llm] @ git+https://github.com/paulneto/survey-agent"`.
+> **Install:** `pip install "survey-agent[llm]"` from PyPI. For unreleased changes on `main`, install
+> from GitHub: `pip install "survey-agent[llm] @ git+https://github.com/paulneto/survey-agent"`.
 
 survey-agent makes a survey something you operate by talking to an AI. A survey is a single file; a
 small, fixed engine runs it. Point a file-access agent (Claude Code, or the Claude desktop app /
@@ -168,6 +166,7 @@ pip install "survey-agent[llm]"          # see the install note above; add ,mcp 
 survey-agent help                                    # a guided tour of the commands + the flow
 survey-agent init my-surveys && cd my-surveys
 survey-agent doctor                                  # verify the CLI runs THIS install (+ which extras/config)
+# put ANTHROPIC_API_KEY or OPENAI_API_KEY in .env first; with no key, author drafts an offline stub
 
 survey-agent author "screen US adults who stream paid video, quota 300, route qualifiers to a task"
 survey-agent list                                    # every survey + purpose + state (draft/tested/live)

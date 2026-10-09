@@ -124,7 +124,5 @@ questions and hope the parse holds.
 ## Get it
 
 Add the MCP connector (setup per host in [AGENT_HOSTS.md](AGENT_HOSTS.md)), or
-`pip install "survey-agent[mcp]"` and run `survey-agent-mcp`. The PyPI package ships with the first
-release; until then install from GitHub:
-`pip install "survey-agent[mcp] @ git+https://github.com/paulneto/survey-agent"`. More agentic surfaces (authoring,
+`pip install "survey-agent[mcp]"` and run `survey-agent-mcp`. More agentic surfaces (authoring,
 critique, persona pre-test, conversation, auto-insight): [AGENTIC_MODES.md](AGENTIC_MODES.md).

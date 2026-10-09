@@ -45,10 +45,6 @@ and has the file access the chat surface lacks. That's the whole trick behind th
 
 These have files, a shell, and (usually) network. Nothing is withheld from them.
 
-The PyPI package ships with the first release; until then install from GitHub:
-`pip install "git+https://github.com/paulneto/survey-agent"` (with extras:
-`pip install "survey-agent[llm] @ git+https://github.com/paulneto/survey-agent"`).
-
 ```bash
 pip install "survey-agent[llm]"      # or [openai] to author with a GPT key
 survey-agent selftest                # zero config, no key, no network

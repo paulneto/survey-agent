@@ -10,8 +10,8 @@ survey-agent is built to be **driven by LLMs like Claude** and **self-hosted by 
 engine depends only on the standard library plus `jsonschema`, `PyYAML` and `regex`; everything
 else is an optional extra. Storage, panel/CRM passback, enrichment, and the LLM are swappable seams.
 Mongo, Render, Firebolt, and Mailchimp appear in this repo only as *reference implementations* of those
-seams, never as requirements. Version 0.1.0; the PyPI package ships with the first release, and until
-then it installs from GitHub (`pip install "git+https://github.com/paulneto/survey-agent"`).
+seams, never as requirements. Version 0.1.0, on PyPI
+(`pip install survey-agent`).
 
 ## Start here (for agents and humans)
 

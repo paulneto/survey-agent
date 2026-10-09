@@ -45,10 +45,6 @@ Codex differ in whether they have files, a shell, network, and MCP; see
 claude mcp add survey-agent -- uvx --from "survey-agent[mcp,llm]" survey-agent-mcp
 ```
 
-> The PyPI package ships with the first release. Until then, install from GitHub:
-> `claude mcp add survey-agent -- uvx --from "survey-agent[mcp,llm] @ git+https://github.com/paulneto/survey-agent" survey-agent-mcp`
-> (or `pip install "git+https://github.com/paulneto/survey-agent"` for the CLI).
-
 Tools exposed:
 
 - **Discover:** `capabilities`, `deployment_readiness` (is this deployment ready to field?),
